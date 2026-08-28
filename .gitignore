@@ -3,3 +3,12 @@
 !.env.example
 __pycache__/
 .pytest_cache/
+
+# Vendor data payloads — never commit. Licensed data, large, and
+# reproducible from the pipeline. Directory structure is kept via .gitkeep.
+data/**
+!data/**/
+!data/**/.gitkeep
+
+# Databento spend ledger (local accounting, not shared state)
+_spend_ledger.json
