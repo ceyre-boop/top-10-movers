@@ -16,6 +16,7 @@ dependencies = [
 model = ["lightgbm>=4.3", "scikit-learn>=1.5"]
 polygon = ["polygon-api-client>=1.14"]
 databento = ["databento>=0.34"]
+crsp = ["wrds>=3.2"]
 collect = ["robin_stocks>=3.0"]
 dev = ["pytest>=8.0", "pytest-cov>=5.0"]
 
