@@ -31,7 +31,7 @@ __all__ = [
     "get_source",
 ]
 
-_VALID_VENDORS = ("polygon", "databento", "crsp")
+_VALID_VENDORS = ("polygon", "databento", "crsp", "composite")
 
 # Known dtype for every column name that appears across the frozen contracts
 # in top10/data/base.py. Columns not listed here are left as-is (object).
@@ -130,6 +130,10 @@ def get_source(vendor: str | None = None) -> MarketDataSource:
         from top10.data.crsp import CRSPSource
 
         return CRSPSource()
+    if resolved == "composite":
+        from top10.data.composite import CompositeSource
+
+        return CompositeSource()
 
     raise ValueError(
         f"unknown market data vendor {resolved!r}; valid vendors: {', '.join(_VALID_VENDORS)}"

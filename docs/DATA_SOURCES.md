@@ -9,14 +9,66 @@ Cross-reference `docs/LABEL_SPEC.md`'s P2 survivorship-bias requirement
 
 ## Requirement x source matrix
 
-| Requirement | CRSP (WRDS) | Databento | Polygon | Alpaca | Finnhub | Tiingo | EODHD |
-|---|---|---|---|---|---|---|---|
-| Daily OHLCV, incl. delisted (P2) | Yes — decades, delisted names + delisting returns via `dsedelist` | Yes — `ohlcv-1d`, ALL_SYMBOLS incl. delisted, but only from **2018-05-01** | Yes — grouped-daily incl. delisted, but vendor's "latest known" ticker snapshot, not truly point-in-time | No bulk delisted-history feed | No | Partial — survivor-biased free tier; paid tier has some delisted coverage | Partial — paid tier only |
-| Corporate actions (splits/div/ticker chg) | Yes — `dsedist`, `dsenames` transitions, `dsedelist` | No | Yes — `/v3/reference/splits`, `/v3/reference/dividends`; no bulk ticker-change feed | No | No | Limited | Yes (paid) |
-| Ticker metadata, point-in-time | Yes — `dsenames` `namedt`/`nameendt` are genuinely point-in-time | No | Best-effort — vendor's LATEST classification only, not true point-in-time history | No | No | No | Limited |
-| Premarket minute bars (04:00–09:25 ET) | **No** — standard CRSP has no intraday data; separate CRSP intraday product often not in a university subscription | Yes — `ohlcv-1m`, paid, from 2018-05-01 | Yes — paid | Yes — **free**, IEX feed, 2016+ | No | No | No |
-| Earnings calendar | **No** | No | Yes — best-effort, plan-dependent | No | Yes — free tier, but in practice only ~last 1 month of history regardless of requested range (see `top10/data/free_tier.py`) | No | Limited |
-| Short interest (FINRA) | **No** | No | Yes — `/stocks/v1/short-interest`, plan-dependent | No | No | No | No |
+| Requirement | CRSP (WRDS) | Databento | Polygon | Composite | Alpaca | Finnhub | Tiingo | EODHD |
+|---|---|---|---|---|---|---|---|---|
+| Daily OHLCV, incl. delisted (P2) | Yes — decades, delisted names + delisting returns via `dsedelist` | Yes — `ohlcv-1d`, ALL_SYMBOLS incl. delisted, but only from **2018-05-01** | Yes — grouped-daily incl. delisted, but vendor's "latest known" ticker snapshot, not truly point-in-time | Yes — routed to Databento | No bulk delisted-history feed | No | Partial — survivor-biased free tier; paid tier has some delisted coverage | Partial — paid tier only |
+| Corporate actions (splits/div/ticker chg) | Yes — `dsedist`, `dsenames` transitions, `dsedelist` | No | Yes — `/v3/reference/splits`, `/v3/reference/dividends`; no bulk ticker-change feed | Yes — routed to Polygon, free tier; point-in-time `instrument_id` cross-check via Databento symbology | No | No | Limited | Yes (paid) |
+| Ticker metadata, point-in-time | Yes — `dsenames` `namedt`/`nameendt` are genuinely point-in-time | No | Best-effort — vendor's LATEST classification only, not true point-in-time history | Yes — routed to Polygon (same "latest known" limitation), cross-checked against Databento symbology | No | No | No | Limited |
+| Premarket minute bars (04:00–09:25 ET) | **No** — standard CRSP has no intraday data; separate CRSP intraday product often not in a university subscription | Yes — `ohlcv-1m`, paid, from 2018-05-01 | Yes — paid | Yes — routed to Databento | Yes — **free**, IEX feed, 2016+ | No | No | No |
+| Earnings calendar | **No** | No | Yes — best-effort, plan-dependent | Yes — routed to Finnhub (free tier, ~1 month lookback in practice) | No | Yes — free tier, but in practice only ~last 1 month of history regardless of requested range (see `top10/data/free_tier.py`) | No | Limited |
+| Short interest (FINRA) | **No** | No | Yes — `/stocks/v1/short-interest`, plan-dependent | Routed to Polygon; raises `NotImplementedError` if the account's plan doesn't include it | No | No | No | No |
+
+## `CompositeSource` (`MARKET_DATA_VENDOR=composite`) — the recommended default
+
+**This is the recommended vendor for this project.** No single free source
+covers everything this project needs (see matrix above); `top10.data.
+composite.CompositeSource` routes each `MarketDataSource` method to
+whichever already-wired-up vendor actually covers it, per the explicit
+`ROUTING` table in `top10/data/composite.py` (also readable via
+`CompositeSource.describe_routing()`):
+
+| Method | Routed to | Why |
+|---|---|---|
+| `daily_bars` | Databento | P2-safe full daily cross-section (`ALL_SYMBOLS`, incl. delisted names), 2018-05-01+ |
+| `premarket_bars` | Databento | full-tape 04:00–09:25 ET minute bars, 2018-05-01+ |
+| `corporate_actions` | Polygon | `/v3/reference/splits` + `/v3/reference/dividends` — small reference endpoints, free tier |
+| `ticker_meta` | Polygon | free bulk reference ticker list, cross-checked against Databento symbology for `instrument_id` alignment |
+| `earnings` | Finnhub | `FinnhubEarnings`, free tier |
+| `short_interest` | Polygon | plan-dependent; raises `NotImplementedError` if unavailable |
+
+**`MARKET_DATA_VENDOR=composite` requires BOTH `DATABENTO_API_KEY` and
+`POLYGON_API_KEY`** (Polygon's free tier needs no card) to be set — a
+missing key breaks only the capability routed to that vendor (e.g. a
+missing `FINNHUB_API_KEY` breaks `earnings` but not `daily_bars`), never
+silently degrades to an empty frame. **The Polygon free key is required
+for correct labels: without `corporate_actions`, `top10.labels.
+build_labels` cannot exclude split days (docs/LABEL_SPEC.md
+"Corporate-action exclusions"), and every label set built without it is
+contaminated by split-day price artifacts (e.g. a 1:20 reverse split
+reading as a +1900% return).**
+
+Cross-vendor risk this closes: Databento identifies instruments by
+`instrument_id`; Polygon identifies them by ticker string. A ticker string
+IS reused across unrelated issuers over time — joining a Polygon split
+onto Databento bars by ticker string alone, with no regard for reuse,
+would apply the wrong split to the wrong company. `CompositeSource`
+resolves each `corporate_actions`/`ticker_meta` row's `instrument_id`
+point-in-time (AT that row's own date, via `top10.data.symbology.
+SymbolResolver`), and `CompositeSource.alignment_report(start, end)`
+surfaces every ticker that could NOT be confidently resolved — those rows
+are never silently dropped, only flagged.
+
+Every delegate call goes through the existing on-disk `cached_call`
+(`top10/data/cache.py`), same as every other adapter here: a second
+identical `(capability, start, end)` request performs zero network calls.
+The Polygon delegate is constructed at `calls_per_min=5` to match Polygon's
+actual free-tier ceiling.
+
+**What `composite` still does NOT solve** (same gaps as the underlying
+vendors — see "What Databento's P2 fix does NOT cover" below): no
+authoritative delisting reason/return, no float-shares figure. If any of
+these prove load-bearing, **EODHD at $19.99/mo** remains the cheapest
+paid supplement (see below).
 
 ## What solves P2 (survivorship bias) at research grade
 
@@ -106,11 +158,18 @@ than a full-tape, research-grade one. It would slot in as a
 
 ## What is needed for T1-only vs. T1+T2
 
-- **T1-only (prior-close decisions)** can run entirely on **CRSP**: daily
-  bars, corporate actions, and point-in-time ticker metadata are all
-  covered by `crsp.dsf` / `crsp.dsedist` / `crsp.dsenames` /
-  `crsp.dsedelist`. `top10.data.crsp.CRSPSource.premarket_bars` raises
-  `NotImplementedError` — this is expected and does not block T1.
+- **This user has no WRDS/CRSP access — the recommended path is
+  `MARKET_DATA_VENDOR=composite`.** It covers T1 (daily bars, corporate
+  actions, ticker metadata) AND T2 (premarket bars) in one vendor-agnostic
+  adapter, per the routing table above, requiring only `DATABENTO_API_KEY`
+  and `POLYGON_API_KEY` (free, no card). See "`CompositeSource`" above for
+  what it does and does not solve.
+- **T1-only (prior-close decisions)** can also run entirely on **CRSP**,
+  if/when WRDS access exists: daily bars, corporate actions, and
+  point-in-time ticker metadata are all covered by `crsp.dsf` /
+  `crsp.dsedist` / `crsp.dsenames` / `crsp.dsedelist`. `top10.data.crsp.
+  CRSPSource.premarket_bars` raises `NotImplementedError` — this is
+  expected and does not block T1.
 - **T1+T2 (adds 09:25 ET premarket decisions) requires a second source**
   for premarket minute bars, since CRSP's standard equity database has no
   intraday data and the separate CRSP intraday product is frequently not
@@ -119,16 +178,19 @@ than a full-tape, research-grade one. It would slot in as a
     caveat below.
   - **Databento** (`ohlcv-1m`, paid, 2018-05-01+) — full-tape coverage,
     but no history before 2018-05-01 and adds a cost-guarded paid feed to
-    the pipeline (`top10/data/cost_guard.py`).
+    the pipeline (`top10/data/cost_guard.py`). This is what `composite`
+    routes `premarket_bars` to.
 - Earnings calendar and short interest are **not** covered by CRSP or
   Databento at all; Polygon (`PolygonSource.earnings`,
   `PolygonSource.short_interest`) or Finnhub (`FinnhubEarnings`, free tier,
   ~1 month lookback in practice) are the only wired-up sources for those.
 
-**Recommended combination once WRDS/CRSP access is confirmed:**
-- T1-only: CRSP alone.
-- T1+T2: CRSP (bars/corp-actions/ticker-meta) + Alpaca or Databento
-  (premarket bars) + Polygon or Finnhub (earnings, short interest).
+**Recommended combination:**
+- No WRDS access (this project, today): `MARKET_DATA_VENDOR=composite`
+  (Databento + Polygon free tier + Finnhub free tier, all one adapter).
+- Once WRDS/CRSP access is confirmed: CRSP alone for T1-only; for T1+T2,
+  CRSP (bars/corp-actions/ticker-meta) + Alpaca or Databento (premarket
+  bars) + Polygon or Finnhub (earnings, short interest).
 
 ## IEX ~2.5%-of-SIP caveat (premarket dollar-volume features)
 
