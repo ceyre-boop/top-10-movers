@@ -222,11 +222,17 @@ def test_reused_ticker_does_not_receive_the_other_companys_split(monkeypatch):
 
     source = CompositeSource()
     resolver = source._get_resolver()
-    resolver._intervals["AAA"] = [
-        {"d0": "2000-01-01", "d1": "2020-01-01", "s": "100"},
-        {"d0": "2020-01-01", "d1": "2030-01-01", "s": "200"},
-    ]
-    resolver._loaded = True
+
+    # Resolution is now PER TRADING DAY: Databento reassigns equity
+    # instrument_ids daily, so a persisted range-wide interval map is
+    # wrong (it produced a +8702% median top-10 gainer on live data).
+    # Stub the public single-day resolver rather than any internal state.
+    def _resolve_at(symbol, date, *, client=None):
+        if symbol != "AAA":
+            return None
+        return "100" if pd.Timestamp(date) < pd.Timestamp("2020-01-01") else "200"
+
+    resolver.resolve_at = _resolve_at
 
     df = source.corporate_actions(dt.date(2019, 1, 1), dt.date(2022, 1, 1))
 

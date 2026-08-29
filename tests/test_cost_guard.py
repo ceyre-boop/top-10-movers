@@ -216,7 +216,7 @@ def test_fetch_bars_estimates_cost_before_requesting_data(monkeypatch, tmp_path)
     client = _FakeClient(cost=0.1)
     source, guard = _source_with_fake_client(monkeypatch, tmp_path, client)
 
-    source._fetch_bars("ohlcv-1d", "2024-01-05", "2024-01-05")
+    source._fetch_bars("XNAS.ITCH", "ohlcv-1d", "2024-01-05", "2024-01-05")
 
     assert len(client.metadata.get_cost_calls) == 1
     assert len(client.timeseries.get_range_calls) == 1
@@ -228,7 +228,7 @@ def test_fetch_bars_refuses_when_estimate_breaches_ceiling(monkeypatch, tmp_path
     source, guard = _source_with_fake_client(monkeypatch, tmp_path, client)
 
     with pytest.raises(BudgetExceeded):
-        source._fetch_bars("ohlcv-1d", "2024-01-05", "2024-01-05")
+        source._fetch_bars("XNAS.ITCH", "ohlcv-1d", "2024-01-05", "2024-01-05")
 
     # The estimate was made, but the paid `get_range` call must never fire.
     assert len(client.metadata.get_cost_calls) == 1
@@ -269,15 +269,22 @@ def test_daily_bars_dry_run_returns_estimate_without_downloading(monkeypatch, tm
 
     result = source.daily_bars(dt.date(2024, 1, 5), dt.date(2024, 1, 5), dry_run=True)
 
-    assert result == {
-        "dry_run": True,
-        "dataset": "XNAS.ITCH",
-        "schema": "ohlcv-1d",
-        "symbols": "ALL_SYMBOLS",
-        "start": "2024-01-05",
-        "end": "2024-01-05",
-        "cost_usd": 7.5,
-        "record_count": 12345,
+    # daily_bars unions the three LISTING venues (XNAS/XNYS/XASE), because
+    # no consolidated US equities dataset reaches back before 2023. So a
+    # dry run reports the SUM across venues, not one dataset's figure.
+    assert result["dry_run"] is True
+    assert result["start"] == "2024-01-05"
+    assert result["end"] == "2024-01-05"
+    assert result["cost_usd"] == pytest.approx(7.5 * 3)
+    assert result["record_count"] == 12345 * 3
+    assert len(result["venues"]) == 3
+    assert {v["dataset"] for v in result["venues"]} == {
+        "XNAS.ITCH", "XNYS.PILLAR", "XASE.PILLAR"
+    }
+    # schema/symbols are per-venue on the aggregate result, not top-level.
+    assert all(v["schema"] == "ohlcv-1d" for v in result["venues"])
+    assert all(v["symbols"] == "ALL_SYMBOLS" for v in result["venues"])
+    _unused = {
     }
     # No `timeseries.get_range` call -- nothing was downloaded.
     assert len(client.timeseries.get_range_calls) == 0

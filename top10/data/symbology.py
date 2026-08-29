@@ -1,224 +1,213 @@
 """Point-in-time raw_symbol <-> instrument_id resolution for Databento.
 
-Databento identifies instruments by an integer ``instrument_id``, NOT by the
-raw ticker string. Raw symbols are reused across unrelated companies over
-time -- a delisted ticker is routinely reassigned to a new, unrelated
-issuer years later. Resolving purely on ticker string therefore risks
-silently splicing two different companies' price histories into one
-series -- the same class of error CRSP's PERMNO exists to prevent (see
-``top10/data/crsp.py``).
+VERIFIED FINDING (live run against real Databento data): Databento
+reassigns `instrument_id` DAILY for equities. Spot-checking one liquid,
+rarely-reassigned name (AAPL stayed `27` throughout) hid this; checking
+less liquid names exposed it immediately -- LULU's `instrument_id` across
+seven consecutive trading sessions was `6844, 6843, 6839, 6840, 6841, 6837,
+6837`; MRNA's was `7345, 7343, 7339, 7340, 7342, 7338, 7340`. There is no
+sense in which "the `instrument_id` for LULU" is a single, range-stable
+value the way CRSP's PERMNO is.
 
-:class:`SymbolResolver` builds and persists a point-in-time map of
-``raw_symbol -> [{"d0": start_date, "d1": end_date, "s": instrument_id}, ...]``
-via Databento's ``symbology.resolve`` HTTP endpoint (``client.symbology.
-resolve()``), which is a free metadata-style call -- it does NOT return
+**This means a RANGE-WIDE `symbology.resolve(start_date=..., end_date=...)`
+that returns one `{d0, d1, instrument_id}` interval spanning many days is
+WRONG for equities on this vendor.** Labeling `instrument_id` 6844 as
+"LULU" for every day in a multi-day range is exactly as wrong as labeling
+it "LULU" forever -- on the very next day, `6844` may be assigned to a
+completely different company. In a live test this produced a median
+top-10-gainer return of **+8702%** and rows where two unrelated tickers
+shared an identical close, because the wrong company's price series got
+spliced onto the wrong ticker.
+
+THE FIX: resolution must happen PER TRADING DAY -- `start_date=D`,
+`end_date=D+1` -- and the result must be keyed `(trade_date,
+instrument_id) -> raw_symbol`, never `instrument_id -> raw_symbol` alone.
+:meth:`SymbolResolver.resolve_day` is the ONLY sanctioned way to do this
+resolution in this codebase; there is deliberately no range-wide
+`resolve_range` method left to reach for by accident (see "REMOVED" note
+below). Instrument ids are batched in groups of 500 per day (verified
+working against the live API) since a full day's cross-section can run
+into the thousands of distinct ids.
+
+Each call goes through Databento's `client.symbology.resolve()` HTTP
+endpoint, which is a free metadata-style call -- it does NOT return
 timeseries data and therefore does not go through
-:class:`top10.data.cost_guard.CostGuard`. Once resolved, the map is
-persisted to ``data/raw/databento/symbology/<dataset>.json`` and reused --
-re-resolving an already-covered ``(symbol, date range)`` is wasted spend
-(rate-limited API calls) even though the calls themselves are free.
+:class:`top10.data.cost_guard.CostGuard`. It is, however, slow (one HTTP
+round trip per batch of <=500 ids per day), so every `(dataset, day)`
+result is cached to disk via :func:`top10.data.cache.cached_call` under
+namespace ``databento/symbology/<dataset>`` and NEVER re-resolved once
+cached -- a cached day is reused forever, exactly like every other vendor
+payload in this project.
 
-Each interval's ``d1`` (end date) is treated as EXCLUSIVE, matching
-Databento's own ``symbology.resolve`` date-range convention.
+REMOVED: the old `resolve_range(symbols, start, end)` method, which
+persisted a `raw_symbol -> [{"d0", "d1", "s"}, ...]` interval map spanning
+an arbitrary date range and treated each interval as valid for its entire
+span. That is the exact shape of the +8702% bug once inverted to
+`instrument_id -> raw_symbol` for a whole-universe pull, and even in its
+original `raw_symbol -> instrument_id` direction it is not safe to trust
+for more than a single day for the same reason (a `raw_symbol`'s bound
+`instrument_id` can change day to day, not just when the company itself
+changes). It has been deleted, not merely deprecated, so it cannot be
+reached by accident. :meth:`resolve_at` (kept only for
+`top10.data.composite.CompositeSource` backward compatibility) is now a
+thin, explicitly single-day shim -- see its docstring.
 """
 
 from __future__ import annotations
 
 import datetime as dt
-import json
-from pathlib import Path
 from typing import Any
 
-import pandas as pd
-
-from top10.config import DATA_RAW
+# Re-exported (not used directly in this module any more -- resolution now
+# goes through `top10.data.cache.cached_call`, which reads its own
+# `top10.data.cache.DATA_RAW`) purely so existing test suites that
+# monkeypatch `top10.data.symbology.DATA_RAW` (e.g. `tests/test_composite.py`,
+# not owned by this change) keep working unchanged.
+from top10.config import DATA_RAW  # noqa: F401
+from top10.data.cache import cached_call
 
 
 class AmbiguousSymbolError(RuntimeError):
-    """Raised when a point-in-time lookup matches more than one interval.
+    """Raised when a point-in-time lookup for a SINGLE trading day matches
+    more than one distinct counterpart (e.g. an `instrument_id` bound to
+    two different raw symbols within the same one-day resolve window).
 
-    This should not happen with well-formed Databento symbology data (a
-    raw symbol's resolved intervals are expected to be disjoint in time),
-    but a corrupted/hand-edited persisted map could produce overlapping
-    intervals -- refusing loudly here is safer than silently picking one.
+    This should not happen with well-formed Databento symbology data for a
+    single-day range, but a corrupted/hand-edited cache file could still
+    produce it -- refusing loudly here is safer than silently picking one.
     """
 
 
-def _map_path(dataset: str) -> Path:
-    # `DATA_RAW` is looked up at call time (not baked into a module-level
-    # constant at import time) so tests can monkeypatch
-    # `top10.data.symbology.DATA_RAW`, same pattern as `top10.data.cache`.
-    safe = dataset.replace("/", "_").replace(":", "_")
-    return Path(DATA_RAW) / "databento" / "symbology" / f"{safe}.json"
+def _batched(items: list[str], size: int = 500) -> list[list[str]]:
+    """Split ``items`` into chunks of at most ``size`` -- Databento's
+    `symbology.resolve` is verified working with batches of 500 ids."""
+    return [items[i : i + size] for i in range(0, len(items), size)]
 
 
 class SymbolResolver:
-    """Point-in-time raw_symbol <-> instrument_id map for one dataset.
+    """Per-trading-day `instrument_id <-> raw_symbol` resolution for one
+    Databento dataset (e.g. ``"XNAS.ITCH"``).
 
-    Backed by Databento's ``definition``/``symbology.resolve`` data.
-    Nothing touches the network or the filesystem at construction time --
-    call :meth:`load` (or let :meth:`resolve_range` do it implicitly) to
-    read a previously-persisted map, and :meth:`resolve_range` to fetch and
-    persist new coverage.
+    Nothing touches the network at construction time -- resolution only
+    happens when :meth:`resolve_day` (or the legacy single-day
+    :meth:`resolve_at` shim) is called, and even then only for days not
+    already covered by the on-disk cache.
     """
 
     def __init__(self, dataset: str, client: Any = None) -> None:
         self.dataset = dataset
         self._client = client
-        # raw_symbol -> [{"d0": "YYYY-MM-DD", "d1": "YYYY-MM-DD", "s": "<instrument_id>"}, ...]
-        self._intervals: dict[str, list[dict[str, str]]] = {}
-        self._loaded = False
 
-    # -- persistence ---------------------------------------------------------
+    # -- the sanctioned per-day resolution path -------------------------------
 
-    def _path(self) -> Path:
-        return _map_path(self.dataset)
-
-    def load(self) -> None:
-        """Read the persisted map from disk, if present. Never raises for a
-        missing file -- an empty/unresolved map is the correct starting
-        state for a dataset that has never been resolved before."""
-        path = self._path()
-        if path.exists():
-            with path.open("r") as f:
-                data = json.load(f)
-            self._intervals = {k: list(v) for k, v in data.get("intervals", {}).items()}
-        self._loaded = True
-
-    def _save(self) -> None:
-        path = self._path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w") as f:
-            json.dump({"dataset": self.dataset, "intervals": self._intervals}, f, indent=2)
-
-    def _ensure_loaded(self) -> None:
-        if not self._loaded:
-            self.load()
-
-    # -- resolution ------------------------------------------------------------
-
-    def resolve_range(
+    def resolve_day(
         self,
-        symbols: list[str],
-        start: dt.date,
-        end: dt.date,
+        day: dt.date,
+        instrument_ids: list[Any],
         *,
         client: Any = None,
-        force: bool = False,
-    ) -> None:
-        """Resolve ``symbols`` for ``[start, end)`` and persist the result.
+    ) -> dict[str, str]:
+        """Resolve ``instrument_ids`` to their raw ticker symbols AS OF
+        ``day`` ONLY -- see module docstring for why this must never span
+        more than one trading day for Databento equities.
 
-        Symbols already covered by a persisted interval are skipped unless
-        ``force=True`` -- re-resolving is wasted spend (see module
-        docstring), even though each individual call is free.
+        Returns ``{str(instrument_id): raw_symbol}``, omitting any id
+        Databento could not resolve for this exact day (never guessing).
+        Cached to disk per ``(dataset, day)`` -- a repeat call for the same
+        day makes zero network calls, and days already fully cached (see
+        the cache-key note below) are read straight from disk.
         """
-        self._ensure_loaded()
         client = client or self._client
         if client is None:
-            raise ValueError("resolve_range requires a Databento client (pass client=...)")
+            raise ValueError("resolve_day requires a Databento client (pass client=...)")
 
-        to_resolve = symbols if force else [s for s in symbols if s not in self._intervals]
-        if not to_resolve:
-            return
+        ids = sorted({str(i) for i in instrument_ids if i is not None})
+        if not ids:
+            return {}
 
-        response = client.symbology.resolve(
-            dataset=self.dataset,
-            symbols=to_resolve,
-            stype_in="raw_symbol",
-            stype_out="instrument_id",
-            start_date=start.isoformat(),
-            end_date=end.isoformat(),
-        )
-        result = response.get("result", response)
-        for symbol, intervals in result.items():
-            self._intervals[symbol] = list(intervals)
-        self._save()
+        cache_key = day.isoformat()
 
-    def resolve_at(self, symbol: str, date: dt.date) -> str | None:
-        """Return the ``instrument_id`` bound to ``symbol`` on ``date``, or
-        ``None`` if unresolved for that date. Raises
-        :class:`AmbiguousSymbolError` if more than one interval matches."""
-        self._ensure_loaded()
-        matches = self._matching_intervals(self._intervals.get(symbol, []), date)
-        if not matches:
-            return None
-        if len(matches) > 1:
-            raise AmbiguousSymbolError(
-                f"symbol {symbol!r} resolves to {len(matches)} distinct "
-                f"instrument_ids on {date.isoformat()}: {matches} -- the "
-                "persisted symbology map has overlapping intervals."
-            )
-        return matches[0]
+        def _fetch() -> dict[str, str]:
+            mapping: dict[str, str] = {}
+            for batch in _batched(ids, 500):
+                response = client.symbology.resolve(
+                    dataset=self.dataset,
+                    symbols=batch,
+                    stype_in="instrument_id",
+                    stype_out="raw_symbol",
+                    start_date=day.isoformat(),
+                    end_date=(day + dt.timedelta(days=1)).isoformat(),
+                )
+                result = response.get("result", response)
+                for instrument_id, intervals in result.items():
+                    if not intervals:
+                        continue
+                    if len(intervals) > 1:
+                        raise AmbiguousSymbolError(
+                            f"instrument_id {instrument_id!r} resolved to "
+                            f"{len(intervals)} distinct raw symbols within the "
+                            f"single day {day.isoformat()}: {intervals} -- the "
+                            "cached/returned symbology data is corrupted for "
+                            "this day."
+                        )
+                    interval = intervals[0]
+                    symbol = interval.get("s") if isinstance(interval, dict) else interval
+                    if symbol is not None:
+                        mapping[str(instrument_id)] = symbol
+            return mapping
 
-    def symbol_at(self, instrument_id: str, date: dt.date) -> str | None:
-        """Inverse of :meth:`resolve_at`: the raw symbol bound to
-        ``instrument_id`` on ``date``, or ``None`` if unresolved. Raises
-        :class:`AmbiguousSymbolError` if more than one raw symbol maps to
-        the same ``instrument_id`` on that date (should not happen -- an
-        instrument_id is Databento's stable identifier)."""
-        self._ensure_loaded()
-        instrument_id = str(instrument_id)
-        candidates: set[str] = set()
-        for symbol, intervals in self._intervals.items():
-            for iv in intervals:
-                if str(iv.get("s")) == instrument_id and self._in_interval(iv, date):
-                    candidates.add(symbol)
-        if not candidates:
-            return None
-        if len(candidates) > 1:
-            raise AmbiguousSymbolError(
-                f"instrument_id {instrument_id!r} resolves to {len(candidates)} "
-                f"distinct raw symbols on {date.isoformat()}: {sorted(candidates)}"
-            )
-        return next(iter(candidates))
+        return cached_call(f"databento/symbology/{self.dataset}", cache_key, _fetch)
 
-    @staticmethod
-    def _in_interval(interval: dict[str, str], date: dt.date) -> bool:
-        d = pd.Timestamp(date)
-        d0 = pd.Timestamp(interval["d0"])
-        d1 = pd.Timestamp(interval["d1"])
-        # `d1` is EXCLUSIVE, matching Databento's own convention.
-        return d0 <= d < d1
+    # -- legacy shim: kept ONLY for CompositeSource backward compatibility --
 
-    def _matching_intervals(self, intervals: list[dict[str, str]], date: dt.date) -> list[str]:
-        return [str(iv["s"]) for iv in intervals if self._in_interval(iv, date)]
+    def resolve_at(
+        self, symbol: str, date: dt.date, *, client: Any = None
+    ) -> str | None:
+        """Point-in-time raw_symbol -> instrument_id, resolved fresh for
+        exactly ``[date, date + 1 day)`` -- NEVER a persisted range-wide
+        interval (see module docstring / REMOVED note for why that is
+        wrong). Kept only so `top10.data.composite.CompositeSource`, which
+        calls this for cross-vendor `instrument_id` alignment, keeps
+        working; it is a single-symbol, single-day resolve, not a bulk
+        path, and is NOT how `DatabentoSource.daily_bars` resolves tickers
+        (that uses :meth:`resolve_day`, the id -> symbol direction, in
+        daily batches of <=500).
 
-    # -- reuse detection ---------------------------------------------------
-
-    def detect_reuse(self, start: dt.date, end: dt.date) -> pd.DataFrame:
-        """Every raw symbol bound to more than one ``instrument_id`` within
-        ``[start, end)``. Symbol reuse (a delisted ticker reassigned to a
-        new, unrelated issuer) is a real phenomenon on US exchanges, not an
-        edge case -- this makes it visible rather than silently correct.
-
-        Columns: ``raw_symbol``, ``instrument_id``, ``interval_start``,
-        ``interval_end``.
+        Returns ``None`` (and makes NO network call) if no client is
+        available -- matching the historical behavior of this method,
+        which only ever read a persisted map that nothing in this codebase
+        currently populates outside of tests.
         """
-        self._ensure_loaded()
-        start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
+        client = client or self._client
+        if client is None:
+            return None
 
-        rows: list[dict[str, Any]] = []
-        for symbol, intervals in self._intervals.items():
-            in_window = []
-            distinct_ids: set[str] = set()
-            for iv in intervals:
-                d0, d1 = pd.Timestamp(iv["d0"]), pd.Timestamp(iv["d1"])
-                # Overlap test against [start_ts, end_ts).
-                if d1 <= start_ts or d0 >= end_ts:
-                    continue
-                in_window.append((d0, d1, str(iv["s"])))
-                distinct_ids.add(str(iv["s"]))
-            if len(distinct_ids) > 1:
-                for d0, d1, instrument_id in in_window:
-                    rows.append(
-                        {
-                            "raw_symbol": symbol,
-                            "instrument_id": instrument_id,
-                            "interval_start": d0,
-                            "interval_end": d1,
-                        }
-                    )
+        cache_key = f"{date.isoformat()}_{symbol}"
 
-        return pd.DataFrame(
-            rows, columns=["raw_symbol", "instrument_id", "interval_start", "interval_end"]
-        ).sort_values(["raw_symbol", "interval_start"]).reset_index(drop=True)
+        def _fetch() -> dict[str, Any]:
+            response = client.symbology.resolve(
+                dataset=self.dataset,
+                symbols=[symbol],
+                stype_in="raw_symbol",
+                stype_out="instrument_id",
+                start_date=date.isoformat(),
+                end_date=(date + dt.timedelta(days=1)).isoformat(),
+            )
+            result = response.get("result", response)
+            intervals = result.get(symbol, [])
+            if len(intervals) > 1:
+                raise AmbiguousSymbolError(
+                    f"symbol {symbol!r} resolved to {len(intervals)} distinct "
+                    f"instrument_ids within the single day {date.isoformat()}: "
+                    f"{intervals}."
+                )
+            interval = intervals[0] if intervals else None
+            instrument_id = (
+                interval.get("s") if isinstance(interval, dict) else interval
+            )
+            return {"instrument_id": instrument_id}
+
+        payload = cached_call(
+            f"databento/symbology_reverse/{self.dataset}", cache_key, _fetch
+        )
+        return payload.get("instrument_id") if payload else None

@@ -254,12 +254,12 @@ def test_polygon_daily_bars_as_of_is_16_00_not_midnight(monkeypatch, tmp_path):
 def test_databento_daily_bars_as_of_is_16_00_not_midnight(monkeypatch, tmp_path):
     monkeypatch.setattr("top10.data.cache.DATA_RAW", tmp_path)
     monkeypatch.delenv("DATABENTO_API_KEY", raising=False)
-    source = DatabentoSource()
+    source = DatabentoSource(venues=["XNAS.ITCH"])
 
     records = [
         {
             "ts_event": "2024-01-05T00:00:00Z",
-            "symbol": "AAPL",
+            "instrument_id": 27,
             "open": 189.5,
             "high": 192.0,
             "low": 188.0,
@@ -267,12 +267,31 @@ def test_databento_daily_bars_as_of_is_16_00_not_midnight(monkeypatch, tmp_path)
             "volume": 1_000_000.0,
         }
     ]
-    monkeypatch.setattr(source, "_fetch_bars", lambda *a, **k: records)
+
+    def _fake_fetch_bars(dataset, schema, start, end, symbols="ALL_SYMBOLS", *, confirm=False):
+        return [] if schema == "definition" else records
+
+    monkeypatch.setattr(source, "_fetch_bars", _fake_fetch_bars)
+
+    class _FakeSymbology:
+        def resolve(self, **kwargs):
+            return {"result": {"27": [{"d0": kwargs["start_date"], "d1": kwargs["end_date"], "s": "AAPL"}]}}
+
+    class _FakeMetadata:
+        def get_dataset_condition(self, **kwargs):
+            return []
+
+    class _FakeClient:
+        symbology = _FakeSymbology()
+        metadata = _FakeMetadata()
+
+    monkeypatch.setattr(source, "_get_client", lambda: _FakeClient())
 
     df = source.daily_bars(dt.date(2024, 1, 5), dt.date(2024, 1, 5))
 
     as_of_naive = df["as_of"].dt.tz_localize(None) if df["as_of"].dt.tz is not None else df["as_of"]
     assert (as_of_naive == pd.Timestamp("2024-01-05 16:00:00")).all()
+    assert df["ticker"].iloc[0] == "AAPL"
 
 
 # --- Defect 2 / boundary agreement: the 09:25 bar must be EXCLUDED ----------

@@ -1,10 +1,12 @@
-"""Offline tests for the Databento P2 (survivorship-bias) defense: the
-full-cross-section daily pull, point-in-time symbol resolution, inferred
-delistings, and the loud survivorship-verification check.
+"""Offline tests for the Databento P2 (survivorship-bias) defense AND for
+the live-data-verified fixes to this adapter's model of Databento equities
+(see the module docstring of `top10/data/databento.py` and
+`top10/data/symbology.py` for the full write-up of each finding).
 
 No network access, no API keys, no live paid Databento calls -- every
 Databento SDK object used here is a fake/mock. Free metadata-style calls
-(`metadata.get_cost`, `symbology.resolve`) are simulated the same way.
+(`metadata.get_cost`, `metadata.get_dataset_condition`, `symbology.resolve`)
+are simulated the same way.
 """
 
 from __future__ import annotations
@@ -16,6 +18,8 @@ import pytest
 
 from top10.data.databento import (
     DatabentoSource,
+    FIRST_AVAILABLE_DATE,
+    LISTING_VENUE_DATASETS,
     SurvivorshipReport,
     delistings_to_corporate_actions,
     infer_delistings,
@@ -24,25 +28,97 @@ from top10.data.databento import (
 from top10.data.symbology import AmbiguousSymbolError, SymbolResolver
 
 
+# --- shared fakes ------------------------------------------------------------
+
+
+class _FakeMetadata:
+    """Fakes the two free metadata endpoints this adapter calls:
+    `get_cost` (cost estimate, used by `CostGuard`) and
+    `get_dataset_condition` (degraded/pending day flags)."""
+
+    def __init__(self, cost: float = 0.01, condition: dict[str, list[dict]] | None = None):
+        self.cost = cost
+        self.condition = condition or {}
+        self.get_cost_calls: list[dict] = []
+        self.get_dataset_condition_calls: list[dict] = []
+
+    def get_cost(self, **kwargs):
+        self.get_cost_calls.append(kwargs)
+        return self.cost
+
+    def get_record_count(self, **kwargs):
+        return 0
+
+    def get_dataset_condition(self, dataset, start_date, end_date):
+        self.get_dataset_condition_calls.append(
+            {"dataset": dataset, "start_date": start_date, "end_date": end_date}
+        )
+        return self.condition.get(dataset, [])
+
+
+class _FakeSymbology:
+    """Fakes `client.symbology.resolve`. `mapping` is keyed
+    `(dataset, start_date_iso)` -> `{input_symbol_str: output_symbol_str}`,
+    mirroring exactly the per-DAY request `SymbolResolver.resolve_day` /
+    `resolve_at` make (`start_date`, `end_date=start_date+1`) -- there is no
+    way to configure a multi-day interval here, which is the point."""
+
+    def __init__(self, mapping: dict[tuple[str, str], dict[str, str]] | None = None):
+        self.mapping = mapping or {}
+        self.calls: list[dict] = []
+
+    def resolve(self, *, dataset, symbols, stype_in, stype_out, start_date, end_date):
+        self.calls.append(
+            dict(
+                dataset=dataset,
+                symbols=list(symbols),
+                stype_in=stype_in,
+                stype_out=stype_out,
+                start_date=start_date,
+                end_date=end_date,
+            )
+        )
+        day_map = self.mapping.get((dataset, start_date), {})
+        result: dict[str, list[dict[str, str]]] = {}
+        for s in symbols:
+            if s in day_map:
+                result[s] = [{"d0": start_date, "d1": end_date, "s": day_map[s]}]
+        return {"result": result}
+
+
+class _FakeClient:
+    def __init__(
+        self,
+        cost: float = 0.01,
+        symbology_mapping: dict[tuple[str, str], dict[str, str]] | None = None,
+        condition: dict[str, list[dict]] | None = None,
+    ):
+        self.metadata = _FakeMetadata(cost=cost, condition=condition)
+        self.symbology = _FakeSymbology(symbology_mapping)
+
+
+def _make_source(monkeypatch, tmp_path, venues=None) -> DatabentoSource:
+    monkeypatch.setattr("top10.data.cache.DATA_RAW", tmp_path)
+    monkeypatch.delenv("DATABENTO_API_KEY", raising=False)
+    return DatabentoSource(venues=venues)
+
+
 # --- daily_bars: full cross-section, never a resolved symbol list ----------
 
 
 def test_daily_bars_requests_all_symbols_never_a_resolved_ticker_list(monkeypatch, tmp_path):
     """The P2 defense: `daily_bars` must request `symbols="ALL_SYMBOLS"` for
-    every chunk, NOT a pre-resolved list of ticker strings. Inverting this
-    (resolving "today's" tickers first, then pulling history only for
-    those) is exactly how survivorship bias enters."""
-    monkeypatch.setattr("top10.data.cache.DATA_RAW", tmp_path)
-    monkeypatch.delenv("DATABENTO_API_KEY", raising=False)
-    source = DatabentoSource()
+    every chunk/venue, NOT a pre-resolved list of ticker strings."""
+    source = _make_source(monkeypatch, tmp_path, venues=["XNAS.ITCH"])
 
     calls: list[dict] = []
 
-    def _fake_fetch_bars(schema, start, end, symbols="ALL_SYMBOLS", *, confirm=False):
-        calls.append({"schema": schema, "start": start, "end": end, "symbols": symbols})
+    def _fake_fetch_bars(dataset, schema, start, end, symbols="ALL_SYMBOLS", *, confirm=False):
+        calls.append({"dataset": dataset, "schema": schema, "start": start, "end": end, "symbols": symbols})
         return []
 
     monkeypatch.setattr(source, "_fetch_bars", _fake_fetch_bars)
+    monkeypatch.setattr(source, "_get_client", lambda: _FakeClient())
 
     source.daily_bars(dt.date(2024, 1, 5), dt.date(2024, 1, 10))
 
@@ -51,58 +127,71 @@ def test_daily_bars_requests_all_symbols_never_a_resolved_ticker_list(monkeypatc
         assert call["symbols"] == "ALL_SYMBOLS"
 
 
-def test_daily_bars_carries_instrument_id_as_extra_column(monkeypatch, tmp_path):
-    monkeypatch.setattr("top10.data.cache.DATA_RAW", tmp_path)
-    monkeypatch.delenv("DATABENTO_API_KEY", raising=False)
+def test_daily_bars_unions_the_three_listing_venue_datasets_by_default():
+    """No consolidated US equities dataset exists before 2023 -- finding
+    (1). The default venue set must be exactly the three listing-venue
+    feeds verified to have `ohlcv-1d` history from 2018-05-01."""
     source = DatabentoSource()
+    assert source._venues == LISTING_VENUE_DATASETS
+    assert LISTING_VENUE_DATASETS == ["XNAS.ITCH", "XNYS.PILLAR", "XASE.PILLAR"]
+
+
+def test_daily_bars_carries_instrument_id_as_extra_informational_column(monkeypatch, tmp_path):
+    source = _make_source(monkeypatch, tmp_path, venues=["XNAS.ITCH"])
 
     records = [
         {
             "ts_event": "2024-01-05T00:00:00Z",
-            "symbol": "AAPL",
-            "instrument_id": 12345,
-            "open": 189.5,
-            "high": 192.0,
-            "low": 188.0,
-            "close": 191.0,
-            "volume": 1_000_000.0,
+            "instrument_id": 27,
+            "open": 189.5, "high": 192.0, "low": 188.0, "close": 191.0, "volume": 1_000_000.0,
         }
     ]
-    monkeypatch.setattr(source, "_fetch_bars", lambda *a, **k: records)
+
+    def _fake_fetch_bars(dataset, schema, start, end, symbols="ALL_SYMBOLS", *, confirm=False):
+        return [] if schema == "definition" else records
+
+    monkeypatch.setattr(source, "_fetch_bars", _fake_fetch_bars)
+    fake_client = _FakeClient(symbology_mapping={("XNAS.ITCH", "2024-01-05"): {"27": "AAPL"}})
+    monkeypatch.setattr(source, "_get_client", lambda: fake_client)
 
     df = source.daily_bars(dt.date(2024, 1, 5), dt.date(2024, 1, 5))
 
     assert "instrument_id" in df.columns
-    assert df["instrument_id"].iloc[0] == 12345
+    assert df["ticker"].iloc[0] == "AAPL"
+    assert str(df["instrument_id"].iloc[0]) == "27"
 
 
 def test_daily_bars_chunks_by_month_and_resumes_without_respending(monkeypatch, tmp_path):
     """A mid-pull failure must not re-fetch (and therefore not re-spend on)
     an already-completed month when the same range is requested again."""
-    monkeypatch.setattr("top10.data.cache.DATA_RAW", tmp_path)
-    monkeypatch.delenv("DATABENTO_API_KEY", raising=False)
-    source = DatabentoSource()
+    source = _make_source(monkeypatch, tmp_path, venues=["XNAS.ITCH"])
+    monkeypatch.setattr(source, "_get_client", lambda: _FakeClient(
+        symbology_mapping={
+            ("XNAS.ITCH", "2024-01-05"): {"1": "AAPL"},
+            ("XNAS.ITCH", "2024-02-01"): {"1": "AAPL"},
+            ("XNAS.ITCH", "2024-03-01"): {"1": "AAPL"},
+        }
+    ))
 
     calls: list[tuple[str, str]] = []
 
-    # `cached_call` deliberately never caches an EMPTY payload (see
-    # top10/data/cache.py) so a transient failure can't masquerade as "no
-    # data" -- each chunk here returns a non-empty record so a successful
-    # chunk actually gets checkpointed to disk.
     _record = [
         {
-            "ts_event": "2024-01-05T00:00:00Z",
-            "symbol": "AAPL",
+            "ts_event": "PLACEHOLDER",
             "instrument_id": 1,
             "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0,
         }
     ]
 
-    def _flaky_fetch_bars(schema, start, end, symbols="ALL_SYMBOLS", *, confirm=False):
+    def _flaky_fetch_bars(dataset, schema, start, end, symbols="ALL_SYMBOLS", *, confirm=False):
+        if schema == "definition":
+            return []
         calls.append((start, end))
         if start == "2024-02-01":
             raise RuntimeError("simulated mid-pull network failure")
-        return _record
+        rec = dict(_record[0])
+        rec["ts_event"] = f"{start}T00:00:00Z"
+        return [rec]
 
     monkeypatch.setattr(source, "_fetch_bars", _flaky_fetch_bars)
 
@@ -113,13 +202,15 @@ def test_daily_bars_chunks_by_month_and_resumes_without_respending(monkeypatch, 
     # February chunk's failure -- i.e. it was checkpointed, not lost.
     assert len(calls) == 2  # January (succeeded), February (raised)
 
-    # Fix the flakiness and re-run the SAME range: January must not be
-    # re-fetched (it's already on disk), only February and March.
     calls.clear()
 
-    def _fixed_fetch_bars(schema, start, end, symbols="ALL_SYMBOLS", *, confirm=False):
+    def _fixed_fetch_bars(dataset, schema, start, end, symbols="ALL_SYMBOLS", *, confirm=False):
+        if schema == "definition":
+            return []
         calls.append((start, end))
-        return _record
+        rec = dict(_record[0])
+        rec["ts_event"] = f"{start}T00:00:00Z"
+        return [rec]
 
     monkeypatch.setattr(source, "_fetch_bars", _fixed_fetch_bars)
 
@@ -136,27 +227,31 @@ def test_daily_bars_pulled_frame_keeps_a_2022_delisted_ticker_in_the_2019_univer
 ):
     """The exact P2 repro: a ticker present in 2019 and delisted (absent)
     by 2022 must still appear in the subset of the pulled frame usable to
-    build a 2019 universe -- i.e. the pull is NOT built from a 2022
-    ("today's") ticker list."""
-    monkeypatch.setattr("top10.data.cache.DATA_RAW", tmp_path)
-    monkeypatch.delenv("DATABENTO_API_KEY", raising=False)
-    source = DatabentoSource()
+    build a 2019 universe."""
+    source = _make_source(monkeypatch, tmp_path, venues=["XNAS.ITCH"])
 
-    def _fake_fetch_bars(schema, start, end, symbols="ALL_SYMBOLS", *, confirm=False):
+    symbology_mapping = {
+        ("XNAS.ITCH", "2019-01-02"): {"1": "SURVIVOR", "2": "DELISTED_2020"},
+        ("XNAS.ITCH", "2020-01-01"): {"1": "SURVIVOR"},
+        ("XNAS.ITCH", "2021-01-01"): {"1": "SURVIVOR"},
+        ("XNAS.ITCH", "2022-01-01"): {"1": "SURVIVOR"},
+    }
+    monkeypatch.setattr(source, "_get_client", lambda: _FakeClient(symbology_mapping=symbology_mapping))
+
+    def _fake_fetch_bars(dataset, schema, start, end, symbols="ALL_SYMBOLS", *, confirm=False):
+        if schema == "definition":
+            return []
         records = [
             {
                 "ts_event": f"{start}T00:00:00Z",
-                "symbol": "SURVIVOR",
                 "instrument_id": 1,
                 "open": 10.0, "high": 10.0, "low": 10.0, "close": 10.0, "volume": 100.0,
             }
         ]
-        # DELISTED_2020 only trades during 2019 chunks.
         if start.startswith("2019"):
             records.append(
                 {
                     "ts_event": f"{start}T00:00:00Z",
-                    "symbol": "DELISTED_2020",
                     "instrument_id": 2,
                     "open": 5.0, "high": 5.0, "low": 5.0, "close": 5.0, "volume": 50.0,
                 }
@@ -175,17 +270,296 @@ def test_daily_bars_pulled_frame_keeps_a_2022_delisted_ticker_in_the_2019_univer
     assert "SURVIVOR" in set(universe_2022["ticker"])
 
 
+# --- THE +8702% REGRESSION: instrument_id reassigned daily -----------------
+
+
+def test_daily_bars_resolves_ticker_per_day_not_range_wide(monkeypatch, tmp_path):
+    """THE verified live-data finding: `instrument_id` is REASSIGNED DAILY
+    by Databento (LULU: 6844, 6843, 6839... across consecutive sessions).
+    The SAME `instrument_id` here (6844) is bound to a DIFFERENT company on
+    each of two different days -- a range-wide resolve would have labeled
+    every row "LULU" (whichever ticker its interval happened to cover),
+    exactly the bug that produced a live +8702% median top-10-gainer
+    return. Per-day resolution must produce the CORRECT ticker each day.
+    """
+    source = _make_source(monkeypatch, tmp_path, venues=["XNAS.ITCH"])
+
+    def _fake_fetch_bars(dataset, schema, start, end, symbols="ALL_SYMBOLS", *, confirm=False):
+        if schema == "definition":
+            return []
+        return [
+            {
+                "ts_event": "2024-01-05T00:00:00Z",
+                "instrument_id": 6844,
+                "open": 10.0, "high": 10.0, "low": 10.0, "close": 10.0, "volume": 100.0,
+            },
+            {
+                "ts_event": "2024-01-08T00:00:00Z",
+                "instrument_id": 6844,
+                "open": 900.0, "high": 900.0, "low": 900.0, "close": 900.0, "volume": 5.0,
+            },
+        ]
+
+    monkeypatch.setattr(source, "_fetch_bars", _fake_fetch_bars)
+    fake_client = _FakeClient(
+        symbology_mapping={
+            ("XNAS.ITCH", "2024-01-05"): {"6844": "LULU"},
+            ("XNAS.ITCH", "2024-01-08"): {"6844": "MRNA"},
+        }
+    )
+    monkeypatch.setattr(source, "_get_client", lambda: fake_client)
+
+    df = source.daily_bars(dt.date(2024, 1, 5), dt.date(2024, 1, 8))
+
+    jan5 = df[df["trade_date"] == pd.Timestamp("2024-01-05")]
+    jan8 = df[df["trade_date"] == pd.Timestamp("2024-01-08")]
+
+    assert set(jan5["ticker"]) == {"LULU"}
+    assert set(jan8["ticker"]) == {"MRNA"}
+    assert jan5["close"].iloc[0] == 10.0
+    assert jan8["close"].iloc[0] == 900.0
+    # The bug this guards against: labeling id 6844 "LULU" on BOTH days.
+    assert "LULU" not in set(jan8["ticker"])
+    assert "MRNA" not in set(jan5["ticker"])
+
+    # And the resolve calls actually asked for ONE day at a time, never a
+    # multi-day span.
+    for call in fake_client.symbology.calls:
+        d0 = pd.Timestamp(call["start_date"])
+        d1 = pd.Timestamp(call["end_date"])
+        assert (d1 - d0) == pd.Timedelta(days=1)
+
+
+def test_symbol_resolver_has_no_range_wide_resolve_method():
+    """`resolve_range` (which persisted one interval spanning an arbitrary
+    date range) is REMOVED, not merely deprecated -- it cannot be reached
+    by accident."""
+    assert not hasattr(SymbolResolver, "resolve_range")
+
+
+def test_symbol_resolver_resolve_day_batches_ids_in_groups_of_500(tmp_path, monkeypatch):
+    monkeypatch.setattr("top10.data.cache.DATA_RAW", tmp_path)
+
+    ids = list(range(1200))
+    mapping = {("XNAS.ITCH", "2024-01-05"): {str(i): f"T{i}" for i in ids}}
+    client = _FakeClient(symbology_mapping=mapping)
+
+    resolver = SymbolResolver("XNAS.ITCH")
+    result = resolver.resolve_day(dt.date(2024, 1, 5), ids, client=client)
+
+    assert len(result) == 1200
+    assert result["0"] == "T0"
+    assert result["1199"] == "T1199"
+    # 1200 ids in batches of <=500 -> 3 resolve() calls.
+    assert len(client.symbology.calls) == 3
+    for call in client.symbology.calls:
+        assert len(call["symbols"]) <= 500
+
+
+def test_symbol_resolver_resolve_day_caches_per_dataset_and_day(tmp_path, monkeypatch):
+    monkeypatch.setattr("top10.data.cache.DATA_RAW", tmp_path)
+
+    mapping = {("XNAS.ITCH", "2024-01-05"): {"1": "AAPL"}}
+    client = _FakeClient(symbology_mapping=mapping)
+
+    resolver1 = SymbolResolver("XNAS.ITCH")
+    resolver1.resolve_day(dt.date(2024, 1, 5), [1], client=client)
+    assert len(client.symbology.calls) == 1
+
+    # A fresh resolver, same dataset/day/disk: cached, no re-resolve.
+    resolver2 = SymbolResolver("XNAS.ITCH")
+    result = resolver2.resolve_day(dt.date(2024, 1, 5), [1], client=client)
+    assert len(client.symbology.calls) == 1  # unchanged
+    assert result["1"] == "AAPL"
+
+
+def test_symbol_resolver_resolve_day_never_reused_across_different_days(tmp_path, monkeypatch):
+    """A DIFFERENT day for the SAME dataset/id must trigger its OWN
+    resolve -- the disk cache is keyed per (dataset, day), never merged
+    across days into one map."""
+    monkeypatch.setattr("top10.data.cache.DATA_RAW", tmp_path)
+
+    mapping = {
+        ("XNAS.ITCH", "2024-01-05"): {"6844": "LULU"},
+        ("XNAS.ITCH", "2024-01-08"): {"6844": "MRNA"},
+    }
+    client = _FakeClient(symbology_mapping=mapping)
+    resolver = SymbolResolver("XNAS.ITCH")
+
+    r1 = resolver.resolve_day(dt.date(2024, 1, 5), [6844], client=client)
+    r2 = resolver.resolve_day(dt.date(2024, 1, 8), [6844], client=client)
+
+    assert r1["6844"] == "LULU"
+    assert r2["6844"] == "MRNA"
+    assert len(client.symbology.calls) == 2
+
+
+def test_symbol_resolver_resolve_day_ambiguous_result_raises():
+    resolver = SymbolResolver("XNAS.ITCH")
+
+    class _AmbiguousSymbology:
+        def resolve(self, **kwargs):
+            return {"result": {"1": [{"d0": kwargs["start_date"], "d1": kwargs["end_date"], "s": "AAA"},
+                                       {"d0": kwargs["start_date"], "d1": kwargs["end_date"], "s": "BBB"}]}}
+
+    class _Client:
+        symbology = _AmbiguousSymbology()
+
+    with pytest.raises(AmbiguousSymbolError):
+        resolver.resolve_day(dt.date(2024, 1, 5), [1], client=_Client())
+
+
+# --- ts_event: UTC midnight OF the trade date, never tz-converted ----------
+
+
+def test_daily_bars_ts_event_is_utc_date_not_tz_shifted(monkeypatch, tmp_path):
+    """Converting `ts_event` to America/New_York shifts every bar back a
+    day and manufactures phantom weekend sessions (verified live: a
+    "2022-06-05" row -- a Sunday -- appeared from a Monday bar). This must
+    use the UTC date directly."""
+    source = _make_source(monkeypatch, tmp_path, venues=["XNAS.ITCH"])
+
+    # 2022-06-06 is a Monday. Its ohlcv-1d ts_event is UTC midnight of that
+    # SAME date.
+    def _fake_fetch_bars(dataset, schema, start, end, symbols="ALL_SYMBOLS", *, confirm=False):
+        if schema == "definition":
+            return []
+        return [
+            {
+                "ts_event": "2022-06-06T00:00:00Z",
+                "instrument_id": 1,
+                "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0,
+            }
+        ]
+
+    monkeypatch.setattr(source, "_fetch_bars", _fake_fetch_bars)
+    fake_client = _FakeClient(symbology_mapping={("XNAS.ITCH", "2022-06-06"): {"1": "AAPL"}})
+    monkeypatch.setattr(source, "_get_client", lambda: fake_client)
+
+    df = source.daily_bars(dt.date(2022, 6, 6), dt.date(2022, 6, 6))
+
+    trade_dates = set(df["trade_date"].dt.strftime("%Y-%m-%d"))
+    assert trade_dates == {"2022-06-06"}
+    # Explicitly not shifted back a day, and no weekend date manufactured.
+    assert "2022-06-05" not in trade_dates
+    weekday = pd.Timestamp(df["trade_date"].iloc[0]).weekday()
+    assert weekday < 5  # Monday=0 .. Friday=4, never Sat/Sun
+
+
+# --- volume summed across venues, close from the listing venue only -------
+
+
+def test_daily_bars_sums_volume_across_venues_close_from_listing_venue_only(monkeypatch, tmp_path):
+    source = _make_source(monkeypatch, tmp_path, venues=["XNAS.ITCH", "XNYS.PILLAR"])
+
+    def _fake_fetch_bars(dataset, schema, start, end, symbols="ALL_SYMBOLS", *, confirm=False):
+        if schema == "definition":
+            if dataset == "XNAS.ITCH":
+                return [{"raw_symbol": "LULU", "exchange": "XNAS", "instrument_class": "C"}]
+            return []
+        if dataset == "XNAS.ITCH":
+            return [
+                {
+                    "ts_event": "2024-01-05T00:00:00Z",
+                    "instrument_id": 1,
+                    "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 1000.0,
+                }
+            ]
+        # XNYS.PILLAR -- a stray print of the same, Nasdaq-listed, name.
+        return [
+            {
+                "ts_event": "2024-01-05T00:00:00Z",
+                "instrument_id": 999,
+                "open": 100.2, "high": 101.0, "low": 99.0, "close": 100.9, "volume": 500.0,
+            }
+        ]
+
+    monkeypatch.setattr(source, "_fetch_bars", _fake_fetch_bars)
+    fake_client = _FakeClient(
+        symbology_mapping={
+            ("XNAS.ITCH", "2024-01-05"): {"1": "LULU"},
+            ("XNYS.PILLAR", "2024-01-05"): {"999": "LULU"},
+        }
+    )
+    monkeypatch.setattr(source, "_get_client", lambda: fake_client)
+
+    df = source.daily_bars(dt.date(2024, 1, 5), dt.date(2024, 1, 5))
+
+    assert len(df) == 1
+    row = df.iloc[0]
+    assert row["ticker"] == "LULU"
+    # Volume SUMS across both venues' prints of the same name.
+    assert row["volume"] == 1500.0
+    # Close comes from the LISTING venue (XNAS.ITCH, per the definition
+    # pull's exchange field) -- NEVER averaged/last-across-venues.
+    assert row["close"] == 100.5
+
+
+# --- pre-2018-05-01 start rejected loudly -----------------------------------
+
+
+def test_daily_bars_rejects_start_before_first_available_date():
+    source = DatabentoSource()
+    with pytest.raises(ValueError, match="2018-05-01"):
+        source.daily_bars(FIRST_AVAILABLE_DATE - dt.timedelta(days=1), FIRST_AVAILABLE_DATE)
+
+
+def test_estimate_universe_pull_cost_rejects_start_before_first_available_date():
+    source = DatabentoSource()
+    with pytest.raises(ValueError, match="2018-05-01"):
+        source.estimate_universe_pull_cost(
+            FIRST_AVAILABLE_DATE - dt.timedelta(days=1), FIRST_AVAILABLE_DATE
+        )
+
+
+# --- degraded days are surfaced and excluded --------------------------------
+
+
+def test_daily_bars_excludes_and_surfaces_degraded_dates(monkeypatch, tmp_path):
+    """A degraded day silently produces wrong returns -- Databento flags
+    it via the free `metadata.get_dataset_condition` endpoint, and this
+    must both drop the day from the output AND record it for the caller."""
+    source = _make_source(monkeypatch, tmp_path, venues=["XNAS.ITCH"])
+
+    def _fake_fetch_bars(dataset, schema, start, end, symbols="ALL_SYMBOLS", *, confirm=False):
+        if schema == "definition":
+            return []
+        return [
+            {
+                "ts_event": "2024-01-05T00:00:00Z",
+                "instrument_id": 1,
+                "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 10.0,
+            },
+            {
+                "ts_event": "2024-01-08T00:00:00Z",
+                "instrument_id": 1,
+                "open": 2.0, "high": 2.0, "low": 2.0, "close": 2.0, "volume": 20.0,
+            },
+        ]
+
+    monkeypatch.setattr(source, "_fetch_bars", _fake_fetch_bars)
+    fake_client = _FakeClient(
+        symbology_mapping={
+            ("XNAS.ITCH", "2024-01-05"): {"1": "AAPL"},
+            ("XNAS.ITCH", "2024-01-08"): {"1": "AAPL"},
+        },
+        condition={"XNAS.ITCH": [{"date": "2024-01-05", "condition": "degraded"}]},
+    )
+    monkeypatch.setattr(source, "_get_client", lambda: fake_client)
+
+    df = source.daily_bars(dt.date(2024, 1, 5), dt.date(2024, 1, 8))
+
+    trade_dates = set(df["trade_date"].dt.strftime("%Y-%m-%d"))
+    assert "2024-01-05" not in trade_dates
+    assert "2024-01-08" in trade_dates
+    assert any("2024-01-05" in entry for entry in source.last_degraded_dates)
+
+
 # --- cost estimator: no download -------------------------------------------
 
 
-class _FakeMetadata:
-    def __init__(self, cost=0.25):
-        self.cost = cost
-        self.calls: list[dict] = []
-
-    def get_cost(self, **kwargs):
-        self.calls.append(kwargs)
-        return self.cost
+class _FakeMetadataNoCalls(_FakeMetadata):
+    pass
 
 
 class _FakeTimeseriesNoCalls:
@@ -193,135 +567,71 @@ class _FakeTimeseriesNoCalls:
         raise AssertionError("estimate_universe_pull_cost must never download data")
 
 
-class _FakeClient:
+class _FullFakeClient:
     def __init__(self, cost=0.25):
-        self.metadata = _FakeMetadata(cost=cost)
+        self.metadata = _FakeMetadataNoCalls(cost=cost)
         self.timeseries = _FakeTimeseriesNoCalls()
 
 
 def test_estimate_universe_pull_cost_performs_no_download(monkeypatch, tmp_path):
-    monkeypatch.setattr("top10.data.cache.DATA_RAW", tmp_path)
-    monkeypatch.delenv("DATABENTO_API_KEY", raising=False)
-    source = DatabentoSource()
-    client = _FakeClient(cost=0.5)
+    source = _make_source(monkeypatch, tmp_path, venues=["XNAS.ITCH", "XNYS.PILLAR"])
+    client = _FullFakeClient(cost=0.5)
     monkeypatch.setattr(source, "_get_client", lambda: client)
 
     result = source.estimate_universe_pull_cost(dt.date(2024, 1, 5), dt.date(2024, 3, 5))
 
-    # Jan / Feb / Mar -- 3 calendar-month chunks.
-    assert len(client.metadata.calls) == 3
-    assert result["total_cost_usd"] == pytest.approx(1.5)
-    assert len(result["chunks"]) == 3
+    # 3 calendar-month chunks x 2 venues.
+    assert len(client.metadata.get_cost_calls) == 6
+    assert result["total_cost_usd"] == pytest.approx(3.0)
+    assert len(result["chunks"]) == 6
 
 
-# --- symbology: point-in-time resolution + reuse detection -----------------
+# --- symbology: legacy resolve_at shim (CompositeSource backward compat) ---
 
 
-class _FakeSymbology:
-    def __init__(self, response):
-        self._response = response
-        self.calls: list[dict] = []
+def test_symbol_resolver_resolve_at_resolves_a_single_day_only(tmp_path, monkeypatch):
+    monkeypatch.setattr("top10.data.cache.DATA_RAW", tmp_path)
 
-    def resolve(self, **kwargs):
-        self.calls.append(kwargs)
-        return self._response
-
-
-class _FakeSymbologyClient:
-    def __init__(self, response):
-        self.symbology = _FakeSymbology(response)
-
-
-def test_symbol_resolver_resolves_reused_symbol_to_different_instrument_ids(tmp_path, monkeypatch):
-    """Same raw symbol string ("ABC") reassigned to a different, unrelated
-    issuer over time must resolve to two DIFFERENT instrument_ids, never
-    merge into a single series."""
-    monkeypatch.setattr("top10.data.symbology.DATA_RAW", tmp_path)
-
-    response = {
-        "result": {
-            "ABC": [
-                {"d0": "2015-01-01", "d1": "2016-06-01", "s": "1001"},
-                {"d0": "2020-01-01", "d1": "2021-01-01", "s": "2002"},
-            ]
-        }
-    }
-    client = _FakeSymbologyClient(response)
+    mapping = {("XNAS.ITCH", "2024-01-05"): {"ABC": "1001"}}
+    client = _FakeClient(symbology_mapping=mapping)
 
     resolver = SymbolResolver("XNAS.ITCH")
-    resolver.resolve_range(["ABC"], dt.date(2015, 1, 1), dt.date(2021, 1, 1), client=client)
-
-    assert resolver.resolve_at("ABC", dt.date(2015, 6, 1)) == "1001"
-    assert resolver.resolve_at("ABC", dt.date(2020, 6, 1)) == "2002"
-    # Between the two intervals: unresolved, not silently one or the other.
-    assert resolver.resolve_at("ABC", dt.date(2018, 1, 1)) is None
-
-    # instrument_id -> symbol inverse lookup, per-era.
-    assert resolver.symbol_at("1001", dt.date(2015, 6, 1)) == "ABC"
-    assert resolver.symbol_at("2002", dt.date(2020, 6, 1)) == "ABC"
+    assert resolver.resolve_at("ABC", dt.date(2024, 1, 5), client=client) == "1001"
+    # A DIFFERENT day, even for the same symbol, must resolve fresh -- no
+    # persisted range-wide interval is consulted.
+    assert resolver.resolve_at("ABC", dt.date(2024, 1, 8), client=client) is None
 
 
-def test_symbol_resolver_detect_reuse_flags_multi_instrument_symbol(tmp_path, monkeypatch):
-    monkeypatch.setattr("top10.data.symbology.DATA_RAW", tmp_path)
+def test_symbol_resolver_resolve_at_returns_none_without_a_client():
+    """Matches the historical behavior CompositeSource depends on: no
+    client available -> None, no network call attempted."""
+    resolver = SymbolResolver("XNAS.ITCH")
+    assert resolver.resolve_at("ABC", dt.date(2024, 1, 5)) is None
 
-    response = {
-        "result": {
-            "ABC": [
-                {"d0": "2015-01-01", "d1": "2016-06-01", "s": "1001"},
-                {"d0": "2020-01-01", "d1": "2021-01-01", "s": "2002"},
-            ],
-            "STABLE": [
-                {"d0": "2015-01-01", "d1": "2021-01-01", "s": "3003"},
-            ],
-        }
-    }
-    client = _FakeSymbologyClient(response)
+
+def test_symbol_resolver_resolve_at_ambiguous_raises(tmp_path, monkeypatch):
+    monkeypatch.setattr("top10.data.cache.DATA_RAW", tmp_path)
+
+    class _AmbiguousSymbology:
+        def resolve(self, **kwargs):
+            return {
+                "result": {
+                    "ABC": [
+                        {"d0": kwargs["start_date"], "d1": kwargs["end_date"], "s": "1001"},
+                        {"d0": kwargs["start_date"], "d1": kwargs["end_date"], "s": "2002"},
+                    ]
+                }
+            }
+
+    class _Client:
+        symbology = _AmbiguousSymbology()
 
     resolver = SymbolResolver("XNAS.ITCH")
-    resolver.resolve_range(
-        ["ABC", "STABLE"], dt.date(2015, 1, 1), dt.date(2021, 1, 1), client=client
-    )
-
-    reuse = resolver.detect_reuse(dt.date(2015, 1, 1), dt.date(2021, 1, 1))
-
-    assert set(reuse["raw_symbol"]) == {"ABC"}
-    assert set(reuse["instrument_id"]) == {"1001", "2002"}
-    assert "STABLE" not in set(reuse["raw_symbol"])
-
-
-def test_symbol_resolver_persists_and_avoids_reresolving(tmp_path, monkeypatch):
-    monkeypatch.setattr("top10.data.symbology.DATA_RAW", tmp_path)
-
-    response = {"result": {"ABC": [{"d0": "2015-01-01", "d1": "2021-01-01", "s": "1001"}]}}
-    client = _FakeSymbologyClient(response)
-
-    resolver1 = SymbolResolver("XNAS.ITCH")
-    resolver1.resolve_range(["ABC"], dt.date(2015, 1, 1), dt.date(2021, 1, 1), client=client)
-    assert len(client.symbology.calls) == 1
-
-    # A fresh resolver instance, same dataset/disk: must load from disk and
-    # skip re-resolving an already-covered symbol.
-    resolver2 = SymbolResolver("XNAS.ITCH")
-    resolver2.resolve_range(["ABC"], dt.date(2015, 1, 1), dt.date(2021, 1, 1), client=client)
-    assert len(client.symbology.calls) == 1  # unchanged -- no re-resolve
-    assert resolver2.resolve_at("ABC", dt.date(2016, 1, 1)) == "1001"
-
-
-def test_symbol_resolver_ambiguous_overlapping_intervals_raise(tmp_path, monkeypatch):
-    monkeypatch.setattr("top10.data.symbology.DATA_RAW", tmp_path)
-
-    resolver = SymbolResolver("XNAS.ITCH")
-    resolver.load()
-    resolver._intervals["ABC"] = [
-        {"d0": "2015-01-01", "d1": "2016-01-01", "s": "1001"},
-        {"d0": "2015-06-01", "d1": "2016-06-01", "s": "2002"},  # overlaps
-    ]
-
     with pytest.raises(AmbiguousSymbolError):
-        resolver.resolve_at("ABC", dt.date(2015, 7, 1))
+        resolver.resolve_at("ABC", dt.date(2024, 1, 5), client=_Client())
 
 
-# --- infer_delistings: distinguishes a halt from a true stop ---------------
+# --- infer_delistings: keyed on ticker (instrument_id is unsafe now) -------
 
 
 def _bars_frame(rows: list[dict]) -> pd.DataFrame:
@@ -349,14 +659,33 @@ def test_infer_delistings_flags_a_true_stop():
     assert row["confidence"] > 0
 
 
+def test_infer_delistings_keys_on_ticker_even_when_instrument_id_changes_daily():
+    """`instrument_id` is reassigned DAILY by Databento -- keying
+    `infer_delistings` on it (the historical CRSP-style assumption) would
+    treat almost every ordinary trading day as a brand-new "instrument"
+    and flag nearly everything as delisted. `ticker` (correctly resolved
+    per day by `SymbolResolver.resolve_day`) is the stable identity here.
+    """
+    sessions = pd.date_range("2024-01-01", periods=20, freq="B")
+    rows = []
+    for i, d in enumerate(sessions):
+        # SURVIVOR's instrument_id changes EVERY session, exactly like the
+        # live-verified LULU/MRNA finding -- but its ticker never does.
+        rows.append({"trade_date": d, "ticker": "SURVIVOR", "instrument_id": 1000 + i, "close": 10.0})
+
+    daily_bars = _bars_frame(rows)
+    out = infer_delistings(daily_bars, min_gap_days=5)
+
+    # SURVIVOR is present through the final session -- must NOT be flagged,
+    # even though every single day carried a different instrument_id.
+    assert "SURVIVOR" not in set(out["ticker"])
+
+
 def test_infer_delistings_does_not_flag_a_short_halt_that_resumes():
     sessions = pd.date_range("2024-01-01", periods=20, freq="B")
     rows = []
     for d in sessions:
         rows.append({"trade_date": d, "ticker": "SURVIVOR", "instrument_id": 1, "close": 10.0})
-    # HALTED misses a 3-session gap in the middle, then resumes trading
-    # through to the end of the window -- never absent from the FINAL
-    # session, so it must not be flagged.
     halted_sessions = [d for i, d in enumerate(sessions) if i not in (10, 11, 12)]
     for d in halted_sessions:
         rows.append({"trade_date": d, "ticker": "HALTED", "instrument_id": 2, "close": 5.0})
@@ -372,9 +701,6 @@ def test_infer_delistings_short_gap_below_threshold_is_not_flagged():
     rows = []
     for d in sessions:
         rows.append({"trade_date": d, "ticker": "SURVIVOR", "instrument_id": 1, "close": 10.0})
-    # QUIET_STOP disappears only 3 sessions before the window's end --
-    # below min_gap_days=5, more consistent with a brief halt than a
-    # confirmed delisting.
     for d in sessions[:17]:
         rows.append({"trade_date": d, "ticker": "QUIET_STOP", "instrument_id": 2, "close": 5.0})
 
@@ -400,9 +726,6 @@ def test_delistings_to_corporate_actions_shapes_output_and_never_backdates_as_of
     row = out.iloc[0]
     assert row["action_type"] == "delisting"
     assert row["as_of"] == pd.Timestamp("2024-01-16")
-    # as_of must equal the OBSERVABLE (inferred_delist_date), never the
-    # last_trade_date itself -- that would be knowledge before the absence
-    # that triggered the inference had happened.
     assert row["as_of"] != pd.Timestamp("2024-01-15")
     assert out["confidence"].iloc[0] == 0.8
 
@@ -411,9 +734,6 @@ def test_delistings_to_corporate_actions_shapes_output_and_never_backdates_as_of
 
 
 def test_verify_no_survivorship_fails_on_survivor_only_frame():
-    """A frame where every ticker present early is STILL present late is
-    exactly the survivorship-bias signature -- must FAIL loudly, not pass
-    silently."""
     sessions = pd.date_range("2018-06-01", periods=400, freq="B")
     rows = []
     for d in sessions:
@@ -425,7 +745,7 @@ def test_verify_no_survivorship_fails_on_survivor_only_frame():
 
     assert isinstance(report, SurvivorshipReport)
     assert report.passed is False
-    assert not report  # __bool__ reflects passed
+    assert not report
     assert report.disappeared_tickers == set()
 
 
@@ -434,7 +754,6 @@ def test_verify_no_survivorship_passes_when_names_genuinely_disappear():
     rows = []
     for d in sessions:
         rows.append({"trade_date": d, "ticker": "SURVIVOR", "close": 100.0})
-    # DELISTED_CO only trades the first half of the window.
     for d in sessions[: len(sessions) // 2]:
         rows.append({"trade_date": d, "ticker": "DELISTED_CO", "close": 5.0})
 

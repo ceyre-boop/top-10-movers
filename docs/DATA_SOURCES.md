@@ -2,6 +2,94 @@
 
 Status: living doc, updated when a new adapter is wired up (`top10/data/*.py`).
 
+## VERIFIED-AGAINST-LIVE-DATA CORRECTION (read this first)
+
+A LIVE test run against real Databento data found the adapter's PREVIOUS
+model of Databento equities was wrong in ways that silently produced
+garbage -- a median top-10-gainer return of **+8702%** and rows where two
+unrelated tickers shared an identical close. Everything below is verified
+against real API responses, not theorized, and the fix is now live in
+`top10/data/databento.py` / `top10/data/symbology.py`.
+
+1. **`instrument_id` is REASSIGNED DAILY, not a stable per-company id.**
+   LULU's `instrument_id` across seven consecutive sessions: `6844, 6843,
+   6839, 6840, 6841, 6837, 6837`. MRNA's: `7345, 7343, 7339, 7340, 7342,
+   7338, 7340`. (AAPL happened to stay `27` throughout, which is why
+   spot-checking one liquid name hid this bug.) A range-wide
+   `symbology.resolve(start_date=..., end_date=...)` -- one interval
+   spanning many days -- is therefore WRONG: it was labeling id `6844` as
+   "LULU" on every day in range, when the very next day `6844` could be a
+   different company. **Fix:** `SymbolResolver.resolve_day(day,
+   instrument_ids)` resolves EXACTLY one trading day at a time
+   (`start_date=D`, `end_date=D+1`), batched in groups of 500 ids, cached
+   to disk per `(dataset, day)` and never re-resolved. The old
+   `resolve_range` method (persisted multi-day intervals) has been
+   DELETED, not deprecated, so it cannot be reached by accident.
+
+2. **No consolidated US equities dataset exists before 2023.** Verified via
+   `metadata.get_dataset_range`: the three LISTING-VENUE feeds --
+   `XNAS.ITCH` (Nasdaq), `XNYS.PILLAR` (NYSE), `XASE.PILLAR` (AMEX) --
+   all have `ohlcv-1d` from **2018-05-01**. `EQUS.SUMMARY` starts
+   2024-07-01; `DBEQ.BASIC`/`EQUS.MINI`/`IEXG.TOPS`/`XCIS`/`XCHI` start
+   2023-03-28 -- every consolidated feed starts INSIDE this project's
+   2023-01-01 holdout, useless for training. **Fix:**
+   `DatabentoSource.daily_bars` now UNIONS the three listing-venue
+   datasets (`LISTING_VENUE_DATASETS`), never a single dataset.
+
+3. **Per-venue feeds are partial -- volume and price need different
+   treatment.** Each listing-venue dataset contains only trades EXECUTED
+   ON that one exchange.
+   - **Volume**: SUMMED across the three fetched venues for a
+     `(date, ticker)`. This still UNDERSTATES true consolidated (SIP)
+     volume, since ARCX/IEXG/MEMX/etc. venues are not fetched at all --
+     this directly reduces the effective $1M ADV universe filter in
+     LABEL_SPEC relative to a SIP-based filter.
+   - **Close**: taken from the LISTING venue's bar ONLY (the official
+     closing auction runs on the listing venue), from the `definition`
+     schema's `exchange` field -- NEVER averaged or "last one wins"
+     across venues.
+
+4. **`ohlcv-1d` `ts_event` is UTC midnight OF the trade date.** Converting
+   it to America/New_York shifts every bar back one day and manufactures
+   phantom Sunday sessions (verified: a "2022-06-05" row appeared from a
+   Monday bar). **Fix:** the UTC calendar date is used directly, never
+   tz-converted; `as_of` is then stamped at 16:00 ET of that date per the
+   normal P4 contract.
+
+5. **`to_df(map_symbols=True)` does NOT populate `symbol` for
+   `ALL_SYMBOLS` requests** (verified: all 30,379 rows null in a live
+   pull). The adapter never reads `record["symbol"]` for daily bars --
+   ticker resolution goes exclusively through `SymbolResolver.resolve_day`.
+
+6. **`definition` schema gives listing venue + security type.**
+   `raw_symbol`, `exchange` (listing venue), `security_type`/
+   `instrument_class`. Verified values: `C` (common stock), `E` (ETF),
+   `W` (warrant), `P` (preferred), `U` (unit), plus `Q`/`O`/`I`/`A`/`H`/
+   `M` (flagged, not silently treated as common stock). Definition pulls
+   cost ~$0.065/venue/day, so they are pulled for ONE representative day
+   per calendar month per venue and carried forward for that whole month
+   -- a documented staleness tradeoff (a mid-month listing-venue change
+   misclassifies the close venue for the rest of that month), not a bug.
+
+7. **Databento flags degraded days** (verified live: a pull warned
+   `2022-07-18 (degraded), 2022-07-25 (degraded)`). `daily_bars` now
+   calls the free `metadata.get_dataset_condition` endpoint and EXCLUDES
+   degraded/pending days from its output by default (a degraded day
+   silently produces wrong returns), recording which dates were dropped
+   on `DatabentoSource.last_degraded_dates`.
+
+### Verified Databento costs (`ohlcv-1d`, `ALL_SYMBOLS`, all three
+listing-venue datasets unioned)
+
+| Range | Cost |
+|---|---|
+| One day | $0.037 |
+| 2018-05-01 -> 2023-01-01 (pre-holdout training window) | $35.47 |
+| 2018-05-01 -> 2026-08-29 (full history to date) | $68.61 |
+
+Comfortably inside both the $125 promotional credit and `CostGuard`'s
+default $100 ceiling.
+
 This is the decision table for "which vendor(s) do I need to run T1 / T1+T2".
 Cross-reference `docs/LABEL_SPEC.md`'s P2 survivorship-bias requirement
 ("Include names that are later delisted") and `top10/data/base.py`'s frozen
@@ -90,14 +178,18 @@ table:
   present in that day's data, delisted-by-today names included. This is
   the core P2 defense and is marked as such directly in
   `top10/data/databento.py`.
-- `top10/data/symbology.py`'s `SymbolResolver` adds point-in-time
-  raw_symbol <-> `instrument_id` resolution (Databento's stable identifier,
-  carried through `daily_bars` as an extra column beyond the frozen
-  contract, same pattern as CRSP's `permno`) — this closes the symbol-reuse
-  gap that survivorship-fixed-but-ticker-keyed data would otherwise still
-  have: a raw ticker string IS reused across unrelated issuers over time,
-  and `detect_reuse()` makes every such collision visible rather than
-  silently merging two companies' histories into one series.
+- `top10/data/symbology.py`'s `SymbolResolver.resolve_day` performs
+  PER-TRADING-DAY `instrument_id -> raw_symbol` resolution (see
+  "VERIFIED-AGAINST-LIVE-DATA CORRECTION" above — Databento's
+  `instrument_id` is REASSIGNED DAILY, so it is informational-only, NOT
+  the stable cross-day identifier CRSP's `permno` is). `daily_bars`
+  therefore resolves `ticker` fresh for every single trading day, batched
+  in groups of 500 ids, and it is `ticker` — not `instrument_id` — that is
+  now the safe, stable identity to `groupby`/join on across days in a
+  pulled frame (see `infer_delistings`, which is keyed on `ticker` for
+  exactly this reason). `instrument_id` is still carried through
+  `daily_bars` as an extra column beyond the frozen contract, but purely
+  as informational per-row metadata.
 - `infer_delistings()` (in `top10/data/databento.py`) derives delisting
   events from `daily_bars` itself, since Databento has no CRSP-style
   delisting-event table. This is explicitly INFERRED, not authoritative —
