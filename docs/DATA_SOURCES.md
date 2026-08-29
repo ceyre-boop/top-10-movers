@@ -20,11 +20,43 @@ Cross-reference `docs/LABEL_SPEC.md`'s P2 survivorship-bias requirement
 
 ## What solves P2 (survivorship bias) at research grade
 
-**CRSP is the only source here that solves P2 at research grade.** It carries
-delisted securities with proper delisting-return handling (`crsp.dsedelist`:
-`dlstdt`, `dlstcd`, `dlret`) going back decades — this is exactly what the
-LABEL_SPEC universe rule ("Include names that are later delisted") requires
-for a research-grade backtest, not just a forward-looking pilot.
+**The user running this project has NO WRDS/CRSP access.** CRSP is the only
+source in the matrix above that solves P2 at research grade in the
+traditional sense (decades of history, authoritative `dlstcd`/`dlret`
+delisting reason + return via `crsp.dsedelist`) — but it is not available
+here, so it cannot be the answer to the plan's P2 kill criterion for this
+user. **Databento is what actually solves P2 for this project**, starting
+2018-05-01, via a different mechanism than CRSP's authoritative delisting
+table:
+
+- `DatabentoSource.daily_bars` pulls the FULL daily cross-section for every
+  requested trading day (`symbols="ALL_SYMBOLS"`), never a per-symbol pull
+  over a pre-resolved ticker list. Survivorship bias enters when a backtest
+  is built from TODAY's ticker list and history is pulled for those names
+  only; it does NOT enter when each day's universe is built from THAT
+  DAY's true cross-section, because every symbol that traded that day is
+  present in that day's data, delisted-by-today names included. This is
+  the core P2 defense and is marked as such directly in
+  `top10/data/databento.py`.
+- `top10/data/symbology.py`'s `SymbolResolver` adds point-in-time
+  raw_symbol <-> `instrument_id` resolution (Databento's stable identifier,
+  carried through `daily_bars` as an extra column beyond the frozen
+  contract, same pattern as CRSP's `permno`) — this closes the symbol-reuse
+  gap that survivorship-fixed-but-ticker-keyed data would otherwise still
+  have: a raw ticker string IS reused across unrelated issuers over time,
+  and `detect_reuse()` makes every such collision visible rather than
+  silently merging two companies' histories into one series.
+- `infer_delistings()` (in `top10/data/databento.py`) derives delisting
+  events from `daily_bars` itself, since Databento has no CRSP-style
+  delisting-event table. This is explicitly INFERRED, not authoritative —
+  see its docstring for the halt-vs-delisting distinction and the
+  `confidence` column (never a bare boolean).
+- `verify_no_survivorship()` is the loud, runnable check that this is
+  actually working on a given pulled frame: it asserts that tickers
+  present early in the window are absent by the end of it, and treats
+  "zero disappearances" as a FAIL — the survivorship-bias signature is
+  otherwise completely invisible (plausible prices, plausible volumes,
+  plausible date range; only the ticker cast fails to turn over).
 
 Databento and Polygon both technically include delisted names in their bulk
 daily-bars pulls, but:
@@ -39,7 +71,38 @@ daily-bars pulls, but:
 
 CRSP's `dsenames` table, by contrast, updates `namedt`/`nameendt` exactly
 when a name/ticker/exchange/share-code change takes effect — genuinely
-point-in-time, not a "latest known" snapshot.
+point-in-time, not a "latest known" snapshot. If this project ever gets
+WRDS access, CRSP remains the strictly stronger long-run answer to P2
+(decades vs. 2018-05-01+, authoritative delisting reason/return vs.
+inferred-with-confidence) and should replace the Databento-based pipeline
+described above rather than run alongside it.
+
+### What Databento's P2 fix does NOT cover
+
+Even with the pieces above wired up, several things the plan may still need
+are simply absent from Databento and are NOT solved by this fix:
+- **No authoritative delisting reason or delisting return** — `dlstcd`/
+  `dlret`'s CRSP analogs do not exist; `infer_delistings()`'s `confidence`
+  column is a coarse, undocumented-probability triage signal, not a
+  research-grade substitute.
+- **No float-shares figure** (same gap CRSP itself has).
+- **No earnings-calendar feed** (`DatabentoSource.earnings` still raises).
+- **No FINRA short-interest feed** (`DatabentoSource.short_interest` still
+  raises).
+- **No splits/dividends/ticker-change feed** (`DatabentoSource.
+  corporate_actions` still raises for everything except the inferred-
+  delisting rows described above).
+
+**If the free/already-budgeted path above proves insufficient** (e.g. the
+survivorship-verification check fails, or one of the gaps above turns out
+to be load-bearing), **EODHD at $19.99/mo** is the cheapest paid
+supplemental option in this matrix: per the requirement table, its paid
+tier adds delisted-name daily-bars coverage, splits/dividends/ticker-change
+corporate actions, and market-cap/float ticker metadata that Databento does
+not carry at all — at the cost of being a "limited"/paid-tier feed rather
+than a full-tape, research-grade one. It would slot in as a
+`ticker_meta`/`corporate_actions` supplement alongside Databento's
+`daily_bars`, not a replacement for it.
 
 ## What is needed for T1-only vs. T1+T2
 

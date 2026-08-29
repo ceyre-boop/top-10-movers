@@ -201,8 +201,12 @@ def test_databento_unsupported_methods_raise_not_implemented(monkeypatch):
     with pytest.raises(NotImplementedError, match="earnings"):
         source.earnings(dt.date(2024, 1, 1), dt.date(2024, 1, 5))
 
-    with pytest.raises(NotImplementedError, match="corporate-actions"):
+    with pytest.raises(NotImplementedError, match="corporate-actions") as excinfo:
         source.corporate_actions(dt.date(2024, 1, 1), dt.date(2024, 1, 5))
+    # P2: splits/dividends/ticker-changes are still unimplemented, but
+    # delistings are now inferrable -- the message must point at the
+    # helpers that do it (see tests/test_databento_universe.py).
+    assert "infer_delistings" in str(excinfo.value)
 
     with pytest.raises(NotImplementedError, match="listing-metadata"):
         source.ticker_meta(dt.date(2024, 1, 1), dt.date(2024, 1, 5))
