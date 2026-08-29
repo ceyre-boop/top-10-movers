@@ -15,7 +15,9 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import glob
+import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -145,7 +147,12 @@ def _count_files(directory: Path, pattern: str = "**/*") -> int:
     directory = Path(directory)
     if not directory.exists():
         return 0
-    return sum(1 for p in directory.glob(pattern) if p.is_file())
+    # Exclude .gitkeep: it is scaffolding committed to preserve the directory
+    # structure, not data. Counting it reported "1 file" for empty dirs.
+    return sum(
+        1 for p in directory.glob(pattern)
+        if p.is_file() and p.name != ".gitkeep"
+    )
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
@@ -154,7 +161,15 @@ def _cmd_status(args: argparse.Namespace) -> int:
 
     lines: list[str] = []
 
-    vendor = args.vendor or next((v for v in _VENDORS if get_api_key(v)), None) or "(none configured)"
+    # Honour MARKET_DATA_VENDOR before falling back to "first vendor with a
+    # key" -- the old order silently reported a different vendor than the one
+    # get_source() would actually use, which is the worst kind of status lie.
+    vendor = (
+        args.vendor
+        or os.environ.get("MARKET_DATA_VENDOR")
+        or next((v for v in _VENDORS if get_api_key(v)), None)
+        or "(none configured)"
+    )
     lines.append(f"vendor: {vendor}")
 
     for v in _VENDORS:
@@ -171,19 +186,44 @@ def _cmd_status(args: argparse.Namespace) -> int:
     latest_label_date = Path(label_files[-1]).stem if label_files else "(none)"
     lines.append(f"latest label date: {latest_label_date}")
 
-    captured_rh_days = _count_files(Path(DATA_RAW) / "robinhood") if (Path(DATA_RAW) / "robinhood").exists() else 0
-    lines.append(f"captured RH days: {captured_rh_days}")
+    # The collector writes to data/raw/rh_movers/, not .../robinhood/. The old
+    # path meant this always read 0, which would have masked a silently broken
+    # capture cron -- and per P1 a missed day is unrecoverable.
+    rh_dir = Path(DATA_RAW) / "rh_movers"
+    rh_captures = sorted(rh_dir.glob("[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].json")) if rh_dir.exists() else []
+    lines.append(f"captured RH days: {len(rh_captures)}")
+    if rh_captures:
+        latest = rh_captures[-1]
+        try:
+            envelope = json.loads(latest.read_text())
+            available = envelope.get("top_movers_available")
+        except (OSError, ValueError):
+            available = "(unreadable)"
+        lines.append(f"  latest capture: {latest.stem} (true top-movers list present: {available})")
+        if available is False:
+            lines.append("  WARNING: latest capture has NO true top-movers list -- proxy validation cannot score it.")
+    else:
+        lines.append("  WARNING: no captures yet. Per P1 this list exists nowhere historically;")
+        lines.append("  it can only be collected forward, so every missed trading day is permanent.")
 
     experiments_dir = Path(EXPERIMENTS)
     logged_experiment_count = len(list(experiments_dir.glob("EXP-*.md"))) if experiments_dir.exists() else 0
     lines.append(f"logged experiment count: {logged_experiment_count}")
 
+    # Inverted before: assert_holdout_sealed RAISING on a holdout date is the
+    # seal WORKING. Reporting that as "sealed: False" told the reader the
+    # opposite of the truth about the single most important research control.
     try:
         assert_holdout_sealed([HOLDOUT_START])
-        sealed = True
+        sealed = False  # a holdout date passed unchallenged -> seal is NOT holding
     except LeakageError:
-        sealed = False
-    lines.append(f"holdout sealed: {sealed} (unseal requires token={UNSEAL_TOKEN!r})")
+        sealed = True  # refused, as it must
+    lines.append(
+        f"holdout sealed: {sealed} "
+        f"(holdout starts {HOLDOUT_START}; unseal requires token={UNSEAL_TOKEN!r})"
+    )
+    if not sealed:
+        lines.append("  WARNING: the holdout seal did NOT refuse a holdout-dated request.")
 
     print("\n".join(lines))
     return 0
