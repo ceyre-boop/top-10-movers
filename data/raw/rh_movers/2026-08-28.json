@@ -1,0 +1,174 @@
+{
+  "captured_at_utc": "2026-08-29T02:57:45.682485+00:00",
+  "captured_at_et": "2026-08-28T22:57:45.682485-04:00",
+  "trade_date": "2026-08-28",
+  "sp500": {
+    "_source": "robinhood_sp500",
+    "_fetch_path": "https",
+    "available": true,
+    "payload": {
+      "count": 10,
+      "next": null,
+      "previous": null,
+      "results": [
+        {
+          "instrument_url": "https://api.robinhood.com/instruments/260c451b-fe7b-430e-bed2-22479ea86cd0/",
+          "symbol": "WDAY",
+          "updated_at": "2026-08-28T04:07:49.567923Z",
+          "price_movement": {
+            "market_hours_last_movement_pct": "5.63",
+            "market_hours_last_price": "204.4600"
+          },
+          "description": "Workday, Inc. engages in the development of enterprise cloud applications for finance and human resources. It delivers financial management, human capital management and analytics applications designed for companies, educational institutions and government agencies. The company was founded by David A. Duffield and Aneel Bhusri in March 2005 and is headquartered in Pleasanton, CA."
+        },
+        {
+          "instrument_url": "https://api.robinhood.com/instruments/e82d6674-520d-46e2-bd74-03f9d9aaef65/",
+          "symbol": "DPZ",
+          "updated_at": "2026-08-28T04:02:31.490788Z",
+          "price_movement": {
+            "market_hours_last_movement_pct": "5.45",
+            "market_hours_last_price": "350.1550"
+          },
+          "description": "Domino's Pizza, Inc. engages in the management of a network of company-owned and franchise-owned pizza stores. It operates through the following segments: U.S. Stores, International Franchise, and Supply Chain. The U.S. Stores segment consists of primarily of franchise operations. The International Franchise segment comprises a network of franchised stores. The Supply Chain segment manages regional dough manufacturing and food supply chain centers. The company was founded by James Monaghan and Thomas Stephen Monaghan in 1960 and is headquartered in Ann Arbor, MI."
+        },
+        {
+          "instrument_url": "https://api.robinhood.com/instruments/1e6ea418-e7cf-4450-9b24-32649f939b4d/",
+          "symbol": "LULU",
+          "updated_at": "2026-08-28T04:08:02.549676Z",
+          "price_movement": {
+            "market_hours_last_movement_pct": "5.06",
+            "market_hours_last_price": "120.8200"
+          },
+          "description": "lululemon athletica, Inc. engages in the designing, distributing and retail of athletic apparel and accessories. It company operates through the following business segments: Company-Operated Stores, Direct to Consumer. The Company-Operated Stores segment comprises of lululemon and ivivva brands; and specialize in athletic wear for female youth. The Direct to Consumer segment is involved in e-commerce business. The company was founded by Dennis J. Wilson in 1998 and is headquartered in Vancouver, Canada."
+        },
+        {
+          "instrument_url": "https://api.robinhood.com/instruments/f82f2908-cae3-4b06-86e2-28332a9bdfe3/",
+          "symbol": "NOW",
+          "updated_at": "2026-08-28T04:02:06.644517Z",
+          "price_movement": {
+            "market_hours_last_movement_pct": "4.53",
+            "market_hours_last_price": "144.7000"
+          },
+          "description": "ServiceNow, Inc. engages in the provision of enterprise cloud computing solutions. The firm delivers digital workflows on a single enterprise cloud platform called the Now Platform. Its product portfolio is focused on providing Information Technology, Employee and Customer workflows. It offers its solutions for the industries under the categories of government, financial services, healthcare, telecommunications, manufacturing, IT services, technology, oil & gas, education, and consumer products. The company was founded by Frederic B. Luddy in June 2004 and is headquartered in Santa Clara, CA."
+        },
+        {
+          "instrument_url": "https://api.robinhood.com/instruments/99271df1-5cce-47f4-9480-af09900904c6/",
+          "symbol": "SLB",
+          "updated_at": "2026-08-28T04:04:34.851836Z",
+          "price_movement": {
+            "market_hours_last_movement_pct": "4.21",
+            "market_hours_last_price": "57.3250"
+          },
+          "description": "Schlumberger NV engages in the provision of technology for reservoir characterization, drilling, production and processing to the oil and gas industry. It operates through the following business segments: Digital and Integration; Reservoir Performance; Well Construction; and Production Systems. The Digital and Integration segment combines the company\u2019s software and seismic businesses with its integrated offering of asset performance solutions. The Reservoir Performance segment consists of reservoir-centric technologies and services that are critical to optimizing reservoir productivity and performance. The Well Construction segment includes the full portfolio of products and services to optimize well placement and performance, maximize drilling efficiency, and improve wellbore assurance. The Production Systems segment develops technologies and provides expertise that enhances production and recovery from subsurface reservoirs to the surface, into pipelines, and to refineries. The company was founded by Conrad Schlumberger and Marcel Schlumberger in 1926 and is headquartered in Houston, TX."
+        },
+        {
+          "instrument_url": "https://api.robinhood.com/instruments/c0bb3aec-bd1e-471e-a4f0-ca011cbec711/",
+          "symbol": "AMZN",
+          "updated_at": "2026-08-28T04:03:34.160199Z",
+          "price_movement": {
+            "market_hours_last_movement_pct": "3.95",
+            "market_hours_last_price": "266.3800"
+          },
+          "description": "Amazon.com, Inc. engages in the provision of online retail shopping services. It operates through the following business segments: North America, International, and Amazon Web Services (AWS). The North America segment includes retail sales of consumer products and subscriptions through North America-focused websites such as www.amazon.com and www.amazon.ca. The International segment offers retail sales of consumer products and subscriptions through internationally-focused websites. The Amazon Web Services segment involves in the global sales of compute, storage, database, and AWS service offerings for start-ups, enterprises, government agencies, and academic institutions. The company was founded by Jeffrey P. Bezos in July 1994 and is headquartered in Seattle, WA."
+        },
+        {
+          "instrument_url": "https://api.robinhood.com/instruments/aa7e3b0b-fc04-4d2e-a986-e5c2e6f1b2fb/",
+          "symbol": "EBAY",
+          "updated_at": "2026-08-28T04:04:07.516444Z",
+          "price_movement": {
+            "market_hours_last_movement_pct": "3.61",
+            "market_hours_last_price": "105.6400"
+          },
+          "description": "eBay, Inc. operates as a commerce company. The company platforms include online marketplace and its localized counterparts, including off-platform businesses in South Korea, Japan, and Turkey, as well as eBay\u2019s suite of mobile apps. The company technologies and services are designed to give buyers choice and a breadth of relevant inventory and to enable sellers worldwide to organize and offer their inventory for sale, virtually anytime and anywhere. The company was founded by Pierre M. Omidyar in September 1995 and is headquartered in San Jose, CA."
+        },
+        {
+          "instrument_url": "https://api.robinhood.com/instruments/c3f8a5b3-4496-445b-bc74-85ae22027464/",
+          "symbol": "CHTR",
+          "updated_at": "2026-08-28T04:03:28.997625Z",
+          "price_movement": {
+            "market_hours_last_movement_pct": "3.60",
+            "market_hours_last_price": "153.6600"
+          },
+          "description": "Charter Communications, Inc. engages in the provision of broadband communications services. Its services include Spectrum TV, Spectrum Internet, and Spectrum Voice. The firm offers business-to-business Internet access, data networking, business telephone, video and music entertainment services, and wireless backhaul. It operates through Cable Services segment. Its advertising sales and production services are sold under the Spectrum Reach brand. The company was founded in 1993 and is headquartered in Stamford, CT."
+        },
+        {
+          "instrument_url": "https://api.robinhood.com/instruments/9426f6e8-dde9-4a4d-a8ac-d01a4a4056be/",
+          "symbol": "BG",
+          "updated_at": "2026-08-28T04:04:42.239346Z",
+          "price_movement": {
+            "market_hours_last_movement_pct": "3.48",
+            "market_hours_last_price": "115.4500"
+          },
+          "description": ""
+        },
+        {
+          "instrument_url": "https://api.robinhood.com/instruments/01422ebf-263c-4366-8104-816e2eafdd2b/",
+          "symbol": "EXPE",
+          "updated_at": "2026-08-28T04:08:48.818892Z",
+          "price_movement": {
+            "market_hours_last_movement_pct": "3.30",
+            "market_hours_last_price": "329.4300"
+          },
+          "description": "Expedia Group, Inc. is an online travel company, which engages in the provision of travel products and services to leisure and corporate travelers. It operates through the following business segments: Retail, B2B and trivago. The Retail segment provides a full range of travel and advertising services to worldwide customers through a variety of consumer brands including: Expedia.com and Hotels.com. The B2B segment offers expedia business services organization including Expedia Partner Solutions and Egencia. The trivago segment generates advertising revenue primarily from sending referrals to online travel companies and travel service providers from its hotel metasearch websites. Expedia Group was founded in 1994 and is headquartered in Seattle, WA."
+        }
+      ]
+    }
+  },
+  "top_movers": {
+    "_source": "robinhood_top_movers",
+    "_fetch_path": "https",
+    "available": true,
+    "payload": {
+      "canonical_examples": "",
+      "description": "",
+      "instruments": [
+        "https://api.robinhood.com/instruments/e0fd9b4f-7d48-4646-beb2-4b05b8ac0b71/",
+        "https://api.robinhood.com/instruments/ae0796a7-a1a7-48fc-b125-cc6d7752c7c6/",
+        "https://api.robinhood.com/instruments/f0b7cb76-a8ef-467d-871a-c57d76fb03e4/",
+        "https://api.robinhood.com/instruments/258666ba-708c-4126-8625-67c486eca81c/",
+        "https://api.robinhood.com/instruments/19386783-d850-4459-9ed9-13e6b2975439/",
+        "https://api.robinhood.com/instruments/2e0ec1df-6ac0-4d15-a428-3a518d86ab94/",
+        "https://api.robinhood.com/instruments/8039b63c-1087-4bf1-81f6-2e2aedfbd49f/",
+        "https://api.robinhood.com/instruments/d0379900-21f5-4267-b51b-ec2fdf0ad211/",
+        "https://api.robinhood.com/instruments/da78172f-5cd6-41ec-94b6-6a99da37d17d/",
+        "https://api.robinhood.com/instruments/1455f1a0-d1a1-4562-ad0d-dea0d9ea434e/",
+        "https://api.robinhood.com/instruments/7ae2ee5e-c268-4036-8cc6-0606fb856901/",
+        "https://api.robinhood.com/instruments/36a0e10e-9366-4f35-925f-e022cea39487/",
+        "https://api.robinhood.com/instruments/3cf6eee1-364a-48ee-be25-11187232ba4f/",
+        "https://api.robinhood.com/instruments/c7927373-e759-4bdc-933d-9389e300514e/",
+        "https://api.robinhood.com/instruments/27ab0c87-04da-42d8-a4c1-05da5f2694dc/",
+        "https://api.robinhood.com/instruments/f77b60db-de76-4ea9-88ee-04a189d58f8b/",
+        "https://api.robinhood.com/instruments/4fae2f96-e6b3-4dbb-bb64-f2bd7a17bff7/",
+        "https://api.robinhood.com/instruments/6ba0e5d8-0631-4491-9a07-d2488754781c/",
+        "https://api.robinhood.com/instruments/228087a7-54af-45f9-a006-53ec6e8fb8d4/",
+        "https://api.robinhood.com/instruments/b1829339-79b5-4014-b7e1-a02ee75ec38a/"
+      ],
+      "name": "Top Movers",
+      "slug": "top-movers",
+      "membership_count": 20
+    },
+    "symbols": [
+      "ANSLY",
+      "YDES",
+      "RDIB",
+      "ESTC",
+      "BVHMY",
+      "ELMTY",
+      "VIAAY",
+      "BFLBY",
+      "MCHVY",
+      "CBUMY",
+      "WEJTY",
+      "HAYPY",
+      "CEVIY",
+      "HNORY",
+      "LPTH",
+      "CFIGY",
+      "CTJHY",
+      "SEGSY",
+      "BRUN",
+      "NWKHY"
+    ]
+  },
+  "top_movers_available": true
+}

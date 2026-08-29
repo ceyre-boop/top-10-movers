@@ -5,10 +5,18 @@ __pycache__/
 .pytest_cache/
 
 # Vendor data payloads — never commit. Licensed data, large, and
-# reproducible from the pipeline. Directory structure is kept via .gitkeep.
+# reproducible from the pipeline. Directory structure kept via .gitkeep.
 data/**
 !data/**/
 !data/**/.gitkeep
+
+# EXCEPTIONS — these MUST be committed:
+# Robinhood captures are irreplaceable. P1: no historical archive exists,
+# so the list can only ever be collected forward. A lost day is lost forever.
+!data/raw/rh_movers/**
+# Predictions are the §7 temporal pre-commitment — the git commit IS the
+# evidence that the prediction predated the outcome. Never ignore these.
+!data/predictions/**
 
 # Databento spend ledger (local accounting, not shared state)
 _spend_ledger.json
