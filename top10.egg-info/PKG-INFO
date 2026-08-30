@@ -1,0 +1,25 @@
+Metadata-Version: 2.4
+Name: top10
+Version: 0.1.0
+Summary: TOP10 — Daily Top-Movers Predictor (research vehicle)
+Requires-Python: >=3.11
+Requires-Dist: pandas>=2.2
+Requires-Dist: pyarrow>=16.0
+Requires-Dist: numpy>=1.26
+Requires-Dist: requests>=2.32
+Requires-Dist: python-dotenv>=1.0
+Requires-Dist: scipy>=1.13
+Provides-Extra: model
+Requires-Dist: lightgbm>=4.3; extra == "model"
+Requires-Dist: scikit-learn>=1.5; extra == "model"
+Provides-Extra: polygon
+Requires-Dist: polygon-api-client>=1.14; extra == "polygon"
+Provides-Extra: databento
+Requires-Dist: databento>=0.34; extra == "databento"
+Provides-Extra: crsp
+Requires-Dist: wrds>=3.2; extra == "crsp"
+Provides-Extra: collect
+Requires-Dist: robin_stocks>=3.0; extra == "collect"
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: pytest-cov>=5.0; extra == "dev"

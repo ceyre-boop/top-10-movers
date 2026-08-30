@@ -28,6 +28,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import logging
+
 import numpy as np
 import pandas as pd
 
@@ -74,6 +76,8 @@ DEFAULT_PARAMS: dict[str, dict[str, Any]] = {
 # there is no unseal path here at all, unlike walkforward/experiment's
 # gated `assert_holdout_sealed`. Tuning must never touch holdout, full stop.
 HOLDOUT_START = pd.Timestamp("2023-01-01")
+
+logger = logging.getLogger(__name__)
 
 
 def _focal_loss_binary(gamma: float = 2.0, alpha: float = 0.25):
@@ -188,7 +192,23 @@ class Top10Ranker:
             elif "scale_pos_weight" not in params:
                 n_pos = int(y.sum())
                 n_neg = int(len(y) - n_pos)
-                params["scale_pos_weight"] = float(n_neg / n_pos) if n_pos > 0 else 1.0
+                # LightGBM requires scale_pos_weight > 0 and dies with an
+                # opaque C++ assertion otherwise. A degenerate split (all
+                # positives, or all negatives) must fall back to 1.0 and say
+                # so, not crash -- this surfaced the first time a real fit
+                # ran, because until lightgbm was installed the whole path
+                # was unreachable and its test passed on the import-error
+                # branch instead.
+                if n_pos == 0 or n_neg == 0:
+                    logger.warning(
+                        "fit: degenerate label balance (n_pos=%d, n_neg=%d); "
+                        "scale_pos_weight falls back to 1.0. A real top-10 "
+                        "fit should be ~400:1 -- check the label set.",
+                        n_pos, n_neg,
+                    )
+                    params["scale_pos_weight"] = 1.0
+                else:
+                    params["scale_pos_weight"] = float(n_neg / n_pos)
 
             train_set = lgb.Dataset(X, label=y)
         else:  # lambdarank: group by trade_date, preserving row order within each group.
