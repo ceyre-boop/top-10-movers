@@ -314,3 +314,72 @@ def test_resolve_symbols_raises_not_implemented_naming_the_gap(monkeypatch):
 
     with pytest.raises(NotImplementedError, match="symbol resolution"):
         source.resolve_symbols(["AAPL"], dt.date(2024, 1, 5))
+
+
+# --- Defect 2: the cost guard was not tracking real spend --------------------
+#
+# The $35.47 actually spent went to an ad-hoc
+# data/raw/databento/preholdout/_spend.json (keyed venue/start/end/cost/rows,
+# no `actual_usd`) written by a script that bypassed CostGuard entirely. The
+# real, reconciled ledger lives at data/raw/databento/_spend_ledger.json.
+
+
+def test_cost_guard_reads_reconciled_spend_from_the_real_ledger():
+    from top10.config import PROJECT_ROOT
+
+    guard = CostGuard(ledger_path=PROJECT_ROOT / "data" / "raw" / "databento" / "_spend_ledger.json")
+    assert guard.spent == pytest.approx(35.468129664658)
+
+
+def test_cost_guard_real_ledger_has_exactly_one_reconciliation_entry():
+    from top10.config import PROJECT_ROOT
+
+    guard = CostGuard(ledger_path=PROJECT_ROOT / "data" / "raw" / "databento" / "_spend_ledger.json")
+    assert len(guard._entries) == 1
+
+
+def test_load_raises_clear_error_on_entry_missing_actual_usd(tmp_path):
+    ledger_path = tmp_path / "ledger.json"
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "entries": [
+                    {"venue": "XNAS.ITCH", "start": "2018-05-01", "end": "2019-01-01", "cost": 1.92, "rows": 123}
+                ]
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="actual_usd"):
+        CostGuard(ledger_path=ledger_path)
+
+
+def test_default_ceiling_leaves_credit_aware_headroom(monkeypatch):
+    monkeypatch.delenv("DATABENTO_BUDGET_USD", raising=False)
+    guard = CostGuard(ledger_path=None)
+    assert guard.ceiling_usd == pytest.approx(110.0)
+
+
+def test_default_ceiling_still_overridden_by_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("DATABENTO_BUDGET_USD", "42.5")
+    guard = CostGuard(ledger_path=tmp_path / "ledger.json")
+    assert guard.ceiling_usd == 42.5
+
+
+def test_request_refused_when_it_would_exceed_the_credit_not_just_a_looser_ceiling(
+    tmp_path,
+):
+    # A ceiling deliberately set ABOVE the $125 credit (simulating a
+    # misconfigured override) must still be refused once the request would
+    # push cumulative spend past the credit itself -- the guard's job is to
+    # keep real billing from ever starting, not merely to respect whatever
+    # ceiling was passed in.
+    ledger_path = tmp_path / "ledger.json"
+    ledger_path.write_text(
+        json.dumps({"entries": [{"timestamp": "t", "description": "prior spend", "actual_usd": 120.0}]})
+    )
+    guard = CostGuard(ceiling_usd=200.0, ledger_path=ledger_path, confirm_threshold_usd=100000.0)
+
+    assert guard.spent == 120.0
+    with pytest.raises(BudgetExceeded):
+        guard.guarded_request(lambda: None, cost_estimate=10.0, description="would cross the $125 credit")

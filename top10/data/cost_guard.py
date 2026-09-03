@@ -31,10 +31,20 @@ from typing import Any, Callable, TypeVar
 
 from top10.config import DATA_RAW
 
-# Deliberately below the $125 promotional credit: the whole point of a
-# ceiling is to leave headroom before the credit runs out and real money
-# starts billing, not to spend right up to the edge of it.
-_DEFAULT_BUDGET_USD = 100.0
+# The $125 promotional Databento credit. The ceiling below is derived from
+# this, not set independently, so it stays credit-aware as spend accrues.
+_DEFAULT_CREDIT_USD = 125.0
+
+# Headroom to leave below the credit before real billing could ever start.
+# Deliberately below the credit: the whole point of a ceiling is to leave
+# headroom before the credit runs out, not to spend right up to its edge.
+_DEFAULT_CEILING_HEADROOM_USD = 15.0
+
+# $125 credit - $15 headroom = $110 ceiling. With the $35.47 already spent
+# reconciled into the ledger (see `_spend_ledger.json`'s reconciliation
+# entry), that leaves ~$74.53 of remaining spendable budget with headroom
+# to spare before the credit is exhausted and real billing begins.
+_DEFAULT_BUDGET_USD = _DEFAULT_CREDIT_USD - _DEFAULT_CEILING_HEADROOM_USD
 
 # Above this per-request estimate, spending requires an explicit human
 # `confirm=True` -- see `require_confirmation_above`.
@@ -101,7 +111,18 @@ class CostGuard:
         if self.ledger_path.exists():
             with self.ledger_path.open("r") as f:
                 data = json.load(f)
-            return list(data.get("entries", []))
+            entries = list(data.get("entries", []))
+            for i, entry in enumerate(entries):
+                if "actual_usd" not in entry:
+                    raise ValueError(
+                        f"{self.ledger_path}: entry {i} ({entry!r}) is missing "
+                        "'actual_usd' -- every ledger entry must record actual "
+                        "spend under this key. An ad-hoc entry shaped like the "
+                        "bypass script's preholdout/_spend.json (keyed "
+                        "venue/start/end/cost/rows) must be reconciled into "
+                        "this schema, not appended as-is."
+                    )
+            return entries
         return []
 
     def _save(self) -> None:

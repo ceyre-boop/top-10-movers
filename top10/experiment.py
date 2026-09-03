@@ -32,10 +32,32 @@ HOLDOUT_START = pd.Timestamp("2023-01-01")
 UNSEAL_TOKEN = "PREREG_FROZEN"
 
 _EXP_FILENAME_RE = re.compile(r"^EXP-(\d+)\.md$")
+
+# Accepts both the canonical template line
+#   **Counts toward family-wise correction? (y/n)**: y
+# and the hand-written prose form actually used in EXP-003
+#   **Counts toward family-wise correction?** **YES** -- first fitted model
+# `(y/n)` and the surrounding `**` are optional on either side, and the
+# answer may be `y` or `yes`, case-insensitive. This is deliberately
+# permissive about formatting because the cost of a false negative here
+# (a real logged variant silently not counted, corrupting the Holm
+# denominator) is far worse than the cost of a false positive.
 _COUNTS_LINE_RE = re.compile(
-    r"\*\*Counts toward family-wise correction\?\s*\(y/n\)\*\*:\s*y", re.IGNORECASE
+    r"\*{0,2}Counts toward family-wise correction\?(?:\s*\(y/n\))?\*{0,2}:?\s*\*{0,2}(?:yes|y)\b",
+    re.IGNORECASE,
 )
 _PVALUE_LINE_RE = re.compile(r"p-value\s*=\s*([0-9.eE+-]+)")
+
+
+class NoCitableClaimError(RuntimeError):
+    """Raised when a caller attempts to build a final PREREG claim backed by
+    zero experiments counting toward the family-wise correction.
+
+    Per docs/PREREG_TOP10.md §5.3, "an unlogged run does not count" -- a
+    count of 0 means there is no p-value to Holm-correct and therefore no
+    citable claim, not an empty-but-valid correction. This must be a loud
+    failure, not a null result silently rendered as a "discovery".
+    """
 
 
 def assert_holdout_sealed(dates: Sequence[Any], *, unseal_token: str | None = None) -> None:
@@ -232,4 +254,28 @@ def count_corrected_variants(experiments_dir: Path | str = EXPERIMENTS) -> int:
         text = p.read_text()
         if _COUNTS_LINE_RE.search(text):
             count += 1
+    return count
+
+
+def assert_citable_claim(experiments_dir: Path | str = EXPERIMENTS) -> int:
+    """Guard for the final-claim chokepoint (§5.3): return
+    `count_corrected_variants(experiments_dir)`, raising
+    :class:`NoCitableClaimError` if it is 0.
+
+    Every code path that assembles the final PREREG claim (e.g. feeding
+    p-values into `top10.metrics.family_wise_correction`) must call this
+    first rather than calling `count_corrected_variants` directly and
+    trusting the caller to notice a 0. Zero logged variants means no
+    citable claim can be built, and that must fail loudly rather than
+    silently producing `family_wise_correction([]) == []`.
+    """
+    count = count_corrected_variants(experiments_dir)
+    if count == 0:
+        raise NoCitableClaimError(
+            "count_corrected_variants() == 0: no experiment in "
+            f"{Path(experiments_dir)} counts toward the family-wise "
+            "correction. Per docs/PREREG_TOP10.md §5.3, an unlogged run "
+            "does not count -- a final claim cannot be built on zero "
+            "counted variants."
+        )
     return count

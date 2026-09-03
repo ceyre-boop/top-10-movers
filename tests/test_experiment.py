@@ -8,14 +8,20 @@ import datetime as dt
 import pandas as pd
 import pytest
 
+from pathlib import Path
+
 from top10.experiment import (
     HOLDOUT_START,
+    NoCitableClaimError,
+    assert_citable_claim,
     assert_frame_holdout_sealed,
     assert_holdout_sealed,
     count_corrected_variants,
     log_experiment,
 )
 from top10.storage import LeakageError
+
+EXPERIMENTS_DIR = Path(__file__).resolve().parent.parent / "experiments"
 
 
 # --- assert_holdout_sealed ---------------------------------------------------
@@ -249,3 +255,61 @@ def test_count_corrected_variants_empty_dir(tmp_path):
 def test_count_corrected_variants_ignores_non_exp_files(tmp_path):
     (tmp_path / "README.md").write_text("**Counts toward family-wise correction? (y/n)**: y")
     assert count_corrected_variants(tmp_path) == 0
+
+
+# --- Defect 1: the family-wise correction denominator was silently 0 --------
+#
+# `_COUNTS_LINE_RE` only matched the literal template line
+# `**Counts toward family-wise correction? (y/n)**: y`. EXP-003 was
+# hand-written as `**Counts toward family-wise correction?** **YES** --
+# first fitted model`, which the old regex never matched, so
+# `count_corrected_variants()` silently returned 0 against the real
+# `experiments/` directory.
+
+
+def test_count_corrected_variants_matches_literal_exp003_prose(tmp_path):
+    # Literal reproduction of the hand-written prose EXP-003 originally
+    # shipped with, so rewording the real file can't silently regress this.
+    (tmp_path / "EXP-001.md").write_text(
+        "# Experiment\n\n"
+        "- **Counts toward family-wise correction?** **YES** — first fitted "
+        "model variant. One variant tested so far.\n"
+    )
+    assert count_corrected_variants(tmp_path) == 1
+
+
+def test_count_corrected_variants_still_matches_canonical_template_form(tmp_path):
+    (tmp_path / "EXP-001.md").write_text(
+        "- **Counts toward family-wise correction? (y/n)**: y\n"
+    )
+    assert count_corrected_variants(tmp_path) == 1
+
+
+def test_count_corrected_variants_does_not_match_no_answer(tmp_path):
+    (tmp_path / "EXP-001.md").write_text(
+        "- **Counts toward family-wise correction? (y/n)**: n\n"
+    )
+    assert count_corrected_variants(tmp_path) == 0
+
+
+def test_count_corrected_variants_against_real_experiments_dir():
+    # EXP-001 and EXP-002 are explicitly "NO", EXP-003 is the first (and
+    # so far only) fitted model variant -- the true count is 1.
+    assert count_corrected_variants(EXPERIMENTS_DIR) == 1
+
+
+# --- assert_citable_claim: loud failure on a zero-count final claim --------
+
+
+def test_assert_citable_claim_raises_on_zero_count(tmp_path):
+    with pytest.raises(NoCitableClaimError):
+        assert_citable_claim(tmp_path)
+
+
+def test_assert_citable_claim_returns_count_when_nonzero(tmp_path):
+    log_experiment(**_base_kwargs(tmp_path, counts=True))
+    assert assert_citable_claim(tmp_path) == 1
+
+
+def test_assert_citable_claim_against_real_experiments_dir():
+    assert assert_citable_claim(EXPERIMENTS_DIR) == 1
