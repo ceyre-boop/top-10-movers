@@ -292,10 +292,22 @@ def test_count_corrected_variants_does_not_match_no_answer(tmp_path):
     assert count_corrected_variants(tmp_path) == 0
 
 
-def test_count_corrected_variants_against_real_experiments_dir():
-    # EXP-001 and EXP-002 are explicitly "NO", EXP-003 is the first (and
-    # so far only) fitted model variant -- the true count is 1.
-    assert count_corrected_variants(EXPERIMENTS_DIR) == 1
+def _copy_exp_001_through_003(dest: Path) -> None:
+    # Copies only EXP-001..EXP-003's REAL file contents into an isolated
+    # dir, rather than counting the live `experiments/` directory directly:
+    # another agent works concurrently in this same repo and may file
+    # further EXP-*.md files (e.g. EXP-004+) at any time, which would make
+    # an assertion against the live directory racy/flaky. EXP-001..003 are
+    # this defect's fixed, owned reproduction -- EXP-001/002 are "NO",
+    # EXP-003 is the first (and, as of this fix, only counted-in-this-set)
+    # fitted model variant, so the true count over exactly these three is 1.
+    for name in ("EXP-001.md", "EXP-002.md", "EXP-003.md"):
+        (dest / name).write_text((EXPERIMENTS_DIR / name).read_text())
+
+
+def test_count_corrected_variants_against_real_experiments_dir(tmp_path):
+    _copy_exp_001_through_003(tmp_path)
+    assert count_corrected_variants(tmp_path) == 1
 
 
 # --- assert_citable_claim: loud failure on a zero-count final claim --------
@@ -311,5 +323,6 @@ def test_assert_citable_claim_returns_count_when_nonzero(tmp_path):
     assert assert_citable_claim(tmp_path) == 1
 
 
-def test_assert_citable_claim_against_real_experiments_dir():
-    assert assert_citable_claim(EXPERIMENTS_DIR) == 1
+def test_assert_citable_claim_against_real_experiments_dir(tmp_path):
+    _copy_exp_001_through_003(tmp_path)
+    assert assert_citable_claim(tmp_path) == 1

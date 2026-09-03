@@ -37,7 +37,7 @@ from top10.walkforward import expanding_window_splits, run_walkforward
 
 logger = logging.getLogger(__name__)
 
-_PIT_DATASETS = ("daily_bars", "corporate_actions", "ticker_meta", "earnings")
+_PIT_DATASETS = ("daily_bars", "corporate_actions", "ticker_meta", "earnings", "short_interest")
 
 
 class PipelineAbort(Exception):
@@ -79,6 +79,7 @@ def ingest(vendor: str, start: dt.date, end: dt.date) -> dict[str, pd.DataFrame]
         "corporate_actions": source.corporate_actions,
         "ticker_meta": source.ticker_meta,
         "earnings": source.earnings,
+        "short_interest": source.short_interest,
     }
 
     frames: dict[str, pd.DataFrame] = {}
@@ -93,7 +94,24 @@ def ingest(vendor: str, start: dt.date, end: dt.date) -> dict[str, pd.DataFrame]
             continue
 
         logger.info("ingest: fetching %s %s..%s from vendor=%s", dataset, start, end, vendor)
-        df = fetch_fn(start, end)
+        try:
+            df = fetch_fn(start, end)
+        except NotImplementedError as exc:
+            if dataset != "short_interest":
+                raise
+            # A plan-limited vendor key (or an adapter that simply hasn't
+            # implemented short_interest yet) must degrade ONE feature
+            # family, not abort the whole ingest -- daily_bars/
+            # corporate_actions/ticker_meta/earnings are unaffected.
+            from top10.data.base import SHORT_INTEREST_COLUMNS
+
+            logger.warning(
+                "ingest: %s not available from vendor=%s (%s) -- writing an "
+                "empty SHORT_INTEREST_COLUMNS frame; short-interest features "
+                "will be NaN for this range instead of aborting ingest",
+                dataset, vendor, exc,
+            )
+            df = pd.DataFrame(columns=list(SHORT_INTEREST_COLUMNS))
         write_parquet(df, path)
         frames[dataset] = df
 
@@ -163,6 +181,7 @@ def build_features_step(
     premarket_bars: pd.DataFrame | None = None,
     prior_close: pd.DataFrame | None = None,
     halts: pd.DataFrame | None = None,
+    short_interest: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Build (or resume) T1 or T2 features for every trading day in
     `[start, end]`.
@@ -194,6 +213,10 @@ def build_features_step(
     # here vs `close` in t2, which crashed the only T2 orchestration path.
     prior_close = prior_close if prior_close is not None else _empty_frame(list(PRIOR_CLOSE_COLUMNS))
     halts = halts if halts is not None else pd.DataFrame()
+    if short_interest is None:
+        from top10.data.base import SHORT_INTEREST_COLUMNS
+
+        short_interest = _empty_frame(list(SHORT_INTEREST_COLUMNS))
 
     spec: FeatureSpec = T1_SPEC if task == "T1" else T2_SPEC
 
@@ -230,11 +253,13 @@ def build_features_step(
 
         if task == "T1":
             features = build_t1_features(
-                daily_bars, ticker_meta, earnings, labels_history, market_context, trade_date_ts
+                daily_bars, ticker_meta, earnings, labels_history, market_context, trade_date_ts,
+                short_interest=short_interest,
             )
         else:
             t1_features = build_t1_features(
-                daily_bars, ticker_meta, earnings, labels_history, market_context, trade_date_ts
+                daily_bars, ticker_meta, earnings, labels_history, market_context, trade_date_ts,
+                short_interest=short_interest,
             )
             features = build_t2_features(
                 t1_features, premarket_bars, prior_close, halts, trade_date_ts,
@@ -361,6 +386,7 @@ def run_all(
         ticker_meta=frames.get("ticker_meta"),
         earnings=frames.get("earnings"),
         labels_history=labels,
+        short_interest=frames.get("short_interest"),
     )
 
     results: dict[str, Any] = {

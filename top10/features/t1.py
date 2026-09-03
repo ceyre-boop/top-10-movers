@@ -21,6 +21,7 @@ import datetime as dt
 import numpy as np
 import pandas as pd
 
+from top10.data.base import SHORT_INTEREST_COLUMNS
 from top10.features.spec import T1_COLUMNS
 from top10.leakage import assert_decision_time_safe, assert_self_exclusion
 
@@ -318,6 +319,7 @@ def build_t1_features(
     labels_history: pd.DataFrame,
     market_context: pd.DataFrame,
     trade_date: dt.date | dt.datetime | pd.Timestamp,
+    short_interest: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Build T1 features for every ticker with prior-day bar history.
 
@@ -325,9 +327,20 @@ def build_t1_features(
     frame is filtered to that boundary before it contributes to a
     feature. The universe of tickers is every ticker with at least one
     `daily_bars` row strictly before `trade_date`.
+
+    `short_interest` is its OWN frame (`SHORT_INTEREST_COLUMNS`), never
+    merged into `ticker_meta` -- see `top10/data/base.py`'s comment: FINRA
+    short-interest is a distinct, bi-monthly feed with its own publish-lag
+    semantics, deliberately excluded from `TICKER_META_COLUMNS`. Defaults
+    to an empty, correctly-shaped frame so callers that have no short
+    interest data yet degrade to NaN short-interest features rather than
+    crash.
     """
     trade_date_ts = pd.Timestamp(trade_date)
     decision_time = decision_time_t1(trade_date_ts)
+
+    if short_interest is None:
+        short_interest = pd.DataFrame(columns=list(SHORT_INTEREST_COLUMNS))
 
     bars = daily_bars[
         (daily_bars["trade_date"] < trade_date_ts) & (daily_bars["as_of"] <= decision_time)
@@ -336,20 +349,15 @@ def build_t1_features(
     if bars.empty:
         return pd.DataFrame(columns=list(T1_COLUMNS))
 
-    # Defect 6 (CONFIRMED): these four columns were previously read via
+    # Defect 6 (CONFIRMED): these columns were previously read via
     # `.get(...)` on a per-ticker Series, which returns None/NaN just as
     # quietly whether the VALUE is missing (legitimate) or the COLUMN
-    # itself is absent from `ticker_meta` entirely (a broken/incomplete
-    # adapter contract) -- the latter must raise loudly, not manufacture
-    # permanent silent NaN in production. Only checked when `ticker_meta`
-    # actually carries rows; a genuinely empty meta frame (no data at all)
-    # degrades to NaN via the `meta_row is None` branch below, same as
-    # before.
+    # itself is absent entirely (a broken/incomplete adapter contract) --
+    # the latter must raise loudly, not manufacture permanent silent NaN
+    # in production.
     _REQUIRED_META_COLUMNS = (
         "market_cap",
         "float_shares",
-        "short_interest_pct_float",
-        "days_to_cover",
     )
     if not ticker_meta.empty:
         missing_meta_cols = [c for c in _REQUIRED_META_COLUMNS if c not in ticker_meta.columns]
@@ -360,7 +368,29 @@ def build_t1_features(
                 "raise, not silently produce permanently-NaN features."
             )
 
+    # Defect 3 (CONFIRMED): `short_interest_pct_float` / `days_to_cover`
+    # were read off `ticker_meta`, but `TICKER_META_COLUMNS` deliberately
+    # excludes them -- they live in `SHORT_INTEREST_COLUMNS`, its own
+    # frame. Unlike the `ticker_meta` check above, this check is
+    # UNCONDITIONAL on emptiness: an empty `short_interest` frame with the
+    # wrong columns is still a contract violation, not "no data yet".
+    _REQUIRED_SHORT_INTEREST_COLUMNS = (
+        "short_interest_pct_float",
+        "days_to_cover",
+    )
+    missing_si_cols = [
+        c for c in _REQUIRED_SHORT_INTEREST_COLUMNS if c not in short_interest.columns
+    ]
+    if missing_si_cols:
+        raise KeyError(
+            f"build_t1_features: short_interest frame is missing required column(s) "
+            f"{missing_si_cols} -- Defect 3 (CONFIRMED): a missing short_interest column "
+            "must raise, even for an empty frame, not silently produce permanently-NaN "
+            "features."
+        )
+
     meta_pit = _latest_pit_row(ticker_meta, decision_time)
+    si_pit = _latest_pit_row(short_interest, decision_time)
     mkt_row = _market_context_row(market_context, trade_date_ts, decision_time)
 
     rows = []
@@ -374,10 +404,12 @@ def build_t1_features(
         industry = meta_row.get("industry") if meta_row is not None else None
         market_cap = meta_row.get("market_cap") if meta_row is not None else np.nan
         float_shares = meta_row.get("float_shares") if meta_row is not None else np.nan
-        short_interest = (
-            meta_row.get("short_interest_pct_float") if meta_row is not None else np.nan
+
+        si_row = si_pit.loc[ticker] if ticker in si_pit.index else None
+        short_interest_pct = (
+            si_row.get("short_interest_pct_float") if si_row is not None else np.nan
         )
-        days_to_cover = meta_row.get("days_to_cover") if meta_row is not None else np.nan
+        days_to_cover = si_row.get("days_to_cover") if si_row is not None else np.nan
 
         sector_feats = _sector_onehot_and_biotech(sector, industry)
 
@@ -390,7 +422,7 @@ def build_t1_features(
             **appear_feats,
             **earn_feats,
             **sector_feats,
-            "short_interest_pct_float": float(short_interest) if pd.notna(short_interest) else np.nan,
+            "short_interest_pct_float": float(short_interest_pct) if pd.notna(short_interest_pct) else np.nan,
             "days_to_cover": float(days_to_cover) if pd.notna(days_to_cover) else np.nan,
             **mkt_row,
             "as_of": decision_time,

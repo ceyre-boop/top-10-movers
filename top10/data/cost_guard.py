@@ -95,12 +95,19 @@ class CostGuard:
         ceiling_usd: float | None = None,
         ledger_path: Path | None = None,
         confirm_threshold_usd: float = _DEFAULT_CONFIRM_THRESHOLD_USD,
+        credit_usd: float = _DEFAULT_CREDIT_USD,
     ) -> None:
         if ceiling_usd is None:
             ceiling_usd = float(
                 os.environ.get("DATABENTO_BUDGET_USD", _DEFAULT_BUDGET_USD)
             )
         self.ceiling_usd = ceiling_usd
+        # The real-world promotional credit -- independent of whatever
+        # `ceiling_usd` policy value is configured. Even a misconfigured
+        # ceiling override must never authorize spend past the credit into
+        # real billing, so this is checked in `guarded_request` regardless
+        # of `ceiling_usd`.
+        self.credit_usd = credit_usd
         self.confirm_threshold_usd = confirm_threshold_usd
         self.ledger_path = Path(ledger_path) if ledger_path else _default_ledger_path()
         self._entries: list[dict[str, Any]] = self._load()
@@ -178,6 +185,18 @@ class CostGuard:
                 f"would bring cumulative spend to ${projected:.2f}, over the "
                 f"${self.ceiling_usd:.2f} ceiling (already spent ${self.spent:.2f} "
                 f"per {self.ledger_path})."
+            )
+        # Independent of whatever `ceiling_usd` is configured to: never
+        # authorize spend past the real promotional credit into real
+        # billing. This catches a misconfigured/overridden ceiling that
+        # would otherwise let a request through past the credit.
+        if projected > self.credit_usd:
+            raise BudgetExceeded(
+                f"refusing request {description!r}: estimated ${cost_estimate:.2f} "
+                f"would bring cumulative spend to ${projected:.2f}, over the "
+                f"${self.credit_usd:.2f} promotional credit itself (already spent "
+                f"${self.spent:.2f} per {self.ledger_path}) -- this would spill into "
+                "real billing regardless of the configured ceiling."
             )
 
         result = fetch_fn()

@@ -36,7 +36,7 @@ class _FakeSource:
     name = "fake"
 
     def __init__(self):
-        self.calls = {"daily_bars": 0, "corporate_actions": 0, "ticker_meta": 0, "earnings": 0}
+        self.calls = {"daily_bars": 0, "corporate_actions": 0, "ticker_meta": 0, "earnings": 0, "short_interest": 0}
 
     def daily_bars(self, start, end):
         self.calls["daily_bars"] += 1
@@ -86,8 +86,6 @@ class _FakeSource:
                     # missing column now raises loudly in build_t1_features.
                     "market_cap": 5e9,
                     "float_shares": 1e8,
-                    "short_interest_pct_float": None,
-                    "days_to_cover": None,
                     "as_of": pd.Timestamp("2000-01-01"),
                 }
             )
@@ -96,6 +94,12 @@ class _FakeSource:
     def earnings(self, start, end):
         self.calls["earnings"] += 1
         return pd.DataFrame(columns=["ticker", "report_date", "session", "announced_on", "date_is_revisable", "as_of"])
+
+    def short_interest(self, start, end):
+        self.calls["short_interest"] += 1
+        from top10.data.base import SHORT_INTEREST_COLUMNS
+
+        return pd.DataFrame(columns=list(SHORT_INTEREST_COLUMNS))
 
 
 @pytest.fixture
@@ -122,7 +126,7 @@ class _LargeFakeSource:
     name = "fake-large"
 
     def __init__(self):
-        self.calls = {"daily_bars": 0, "corporate_actions": 0, "ticker_meta": 0, "earnings": 0}
+        self.calls = {"daily_bars": 0, "corporate_actions": 0, "ticker_meta": 0, "earnings": 0, "short_interest": 0}
 
     def daily_bars(self, start, end):
         self.calls["daily_bars"] += 1
@@ -176,8 +180,6 @@ class _LargeFakeSource:
                     "active_to": pd.NaT,
                     "market_cap": 5e9 + i * 1e8,
                     "float_shares": 1e8,
-                    "short_interest_pct_float": None,
-                    "days_to_cover": None,
                     "as_of": pd.Timestamp("2000-01-01"),
                     "sector": _LARGE_UNIVERSE_SECTORS[i % len(_LARGE_UNIVERSE_SECTORS)],
                     "industry": "Misc",
@@ -188,6 +190,12 @@ class _LargeFakeSource:
     def earnings(self, start, end):
         self.calls["earnings"] += 1
         return pd.DataFrame(columns=["ticker", "report_date", "session", "announced_on", "date_is_revisable", "as_of"])
+
+    def short_interest(self, start, end):
+        self.calls["short_interest"] += 1
+        from top10.data.base import SHORT_INTEREST_COLUMNS
+
+        return pd.DataFrame(columns=list(SHORT_INTEREST_COLUMNS))
 
 
 @pytest.fixture
@@ -240,6 +248,43 @@ def test_ingest_different_range_refetches(fake_source, isolated_data_dirs):
     ingest("fake", dt.date(2024, 1, 2), dt.date(2024, 1, 5))
     ingest("fake", dt.date(2024, 2, 1), dt.date(2024, 2, 5))
     assert fake_source.calls["daily_bars"] == 2
+
+
+# --- Defect 3: short_interest ingest path ------------------------------------
+
+
+def test_ingest_fetches_and_persists_short_interest(fake_source, isolated_data_dirs):
+    frames = ingest("fake", dt.date(2024, 1, 2), dt.date(2024, 1, 5))
+    assert fake_source.calls["short_interest"] == 1
+    assert "short_interest" in frames
+
+    pit_path = pipeline._pit_path(
+        "short_interest", "fake", dt.date(2024, 1, 2), dt.date(2024, 1, 5)
+    )
+    assert pit_path.exists()
+
+
+def test_ingest_degrades_short_interest_on_not_implemented(isolated_data_dirs, monkeypatch):
+    """A plan-limited vendor key (or an adapter without a short_interest
+    feed) must degrade ONE feature family -- ingest must not abort the
+    whole pull."""
+    from top10.data.base import SHORT_INTEREST_COLUMNS
+
+    class _NoShortInterestSource(_FakeSource):
+        def short_interest(self, start, end):
+            self.calls["short_interest"] += 1
+            raise NotImplementedError("no short-interest feed for this vendor")
+
+    source = _NoShortInterestSource()
+    monkeypatch.setattr(data_pkg, "get_source", lambda vendor: source, raising=False)
+
+    frames = ingest("fake", dt.date(2024, 1, 2), dt.date(2024, 1, 5))
+
+    # Ingest completed for every OTHER dataset -- it did not abort.
+    assert not frames["daily_bars"].empty
+    # short_interest degrades to an empty, correctly-shaped frame.
+    assert frames["short_interest"].empty
+    assert list(frames["short_interest"].columns) == list(SHORT_INTEREST_COLUMNS)
 
 
 # --- build_labels_step ------------------------------------------------------
@@ -326,7 +371,7 @@ def test_run_sanity_step_passes_on_good_labels():
 def test_build_features_step_is_idempotent(isolated_data_dirs, monkeypatch):
     calls = {"t1": 0}
 
-    def _fake_build_t1(daily_bars, ticker_meta, earnings, labels_history, market_context, trade_date):
+    def _fake_build_t1(daily_bars, ticker_meta, earnings, labels_history, market_context, trade_date, short_interest=None):
         calls["t1"] += 1
         from top10.features.spec import T1_COLUMNS
         from top10.features.t1 import decision_time_t1
@@ -361,6 +406,99 @@ def test_build_features_step_is_idempotent(isolated_data_dirs, monkeypatch):
 
     build_features_step("T1", dt.date(2024, 1, 2), dt.date(2024, 1, 2), daily_bars=daily_bars)
     assert calls["t1"] == 1  # second call must skip, not rebuild
+
+
+# --- build_features_step: short_interest threaded through to build_t1_features -----
+
+
+def test_build_features_step_threads_short_interest_to_build_t1_features(isolated_data_dirs, monkeypatch):
+    from top10.data.base import SHORT_INTEREST_COLUMNS
+
+    received = {}
+
+    def _fake_build_t1(daily_bars, ticker_meta, earnings, labels_history, market_context, trade_date, short_interest=None):
+        received["short_interest"] = short_interest
+        from top10.features.spec import T1_COLUMNS
+        from top10.features.t1 import decision_time_t1
+
+        as_of = decision_time_t1(trade_date)
+        return pd.DataFrame(
+            [
+                {
+                    c: (trade_date if c == "trade_date" else ("AAA" if c == "ticker" else (as_of if c == "as_of" else 0.0)))
+                    for c in T1_COLUMNS
+                }
+            ]
+        )
+
+    import top10.features.t1 as t1_mod
+
+    monkeypatch.setattr(t1_mod, "build_t1_features", _fake_build_t1)
+
+    daily_bars = pd.DataFrame(
+        {
+            "trade_date": [pd.Timestamp("2024-01-02")],
+            "ticker": ["AAA"],
+            "as_of": [pd.Timestamp("2024-01-02")],
+        }
+    )
+    short_interest = pd.DataFrame(
+        [
+            {
+                "ticker": "AAA",
+                "settlement_date": pd.Timestamp("2024-01-01"),
+                "short_interest_shares": 1000.0,
+                "short_interest_pct_float": 5.0,
+                "days_to_cover": 1.5,
+                "as_of": pd.Timestamp("2024-01-01"),
+            }
+        ]
+    )
+
+    build_features_step(
+        "T1", dt.date(2024, 1, 2), dt.date(2024, 1, 2),
+        daily_bars=daily_bars, short_interest=short_interest,
+    )
+
+    assert received["short_interest"] is short_interest
+
+
+def test_build_features_step_defaults_short_interest_to_empty_correct_shape(isolated_data_dirs, monkeypatch):
+    from top10.data.base import SHORT_INTEREST_COLUMNS
+
+    received = {}
+
+    def _fake_build_t1(daily_bars, ticker_meta, earnings, labels_history, market_context, trade_date, short_interest=None):
+        received["short_interest"] = short_interest
+        from top10.features.spec import T1_COLUMNS
+        from top10.features.t1 import decision_time_t1
+
+        as_of = decision_time_t1(trade_date)
+        return pd.DataFrame(
+            [
+                {
+                    c: (trade_date if c == "trade_date" else ("AAA" if c == "ticker" else (as_of if c == "as_of" else 0.0)))
+                    for c in T1_COLUMNS
+                }
+            ]
+        )
+
+    import top10.features.t1 as t1_mod
+
+    monkeypatch.setattr(t1_mod, "build_t1_features", _fake_build_t1)
+
+    daily_bars = pd.DataFrame(
+        {
+            "trade_date": [pd.Timestamp("2024-01-02")],
+            "ticker": ["AAA"],
+            "as_of": [pd.Timestamp("2024-01-02")],
+        }
+    )
+
+    build_features_step("T1", dt.date(2024, 1, 2), dt.date(2024, 1, 2), daily_bars=daily_bars)
+
+    assert received["short_interest"].empty
+    assert list(received["short_interest"].columns) == list(SHORT_INTEREST_COLUMNS)
 
 
 # --- build_features_step: T2 orchestration path (Defect 2) -------------------------
@@ -409,8 +547,6 @@ def test_build_features_step_t2_end_to_end(isolated_data_dirs):
                 "industry": "Software",
                 "market_cap": 5e9,
                 "float_shares": 1e8,
-                "short_interest_pct_float": None,
-                "days_to_cover": None,
                 "as_of": pd.Timestamp("2020-01-01"),
             }
         ]
@@ -575,6 +711,9 @@ def test_ingest_aborts_on_back_adjusted_prices(tmp_path, monkeypatch):
             return pd.DataFrame(columns=["ticker", "as_of"])
         def earnings(self, start, end):
             return pd.DataFrame(columns=["ticker", "as_of"])
+        def short_interest(self, start, end):
+            from top10.data.base import SHORT_INTEREST_COLUMNS
+            return pd.DataFrame(columns=list(SHORT_INTEREST_COLUMNS))
 
     monkeypatch.setattr("top10.data.get_source", lambda vendor=None: _FakeSource())
 

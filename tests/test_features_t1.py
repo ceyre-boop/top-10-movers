@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from top10.data.base import SHORT_INTEREST_COLUMNS
 from top10.features import t1 as t1_mod
 from top10.features.spec import T1_COLUMNS, T1_SPEC, validate_frame
 from top10.leakage import assert_decision_time_safe, assert_self_exclusion
@@ -46,17 +47,33 @@ def _n_days_of_bars(ticker, n, start_close=10.0, drift=0.0, end_date=None, volum
 
 
 def _meta_row(ticker, sector=None, industry=None, market_cap=None, float_shares=None,
-              short_interest_pct_float=None, days_to_cover=None, as_of="2020-01-01"):
+              as_of="2020-01-01"):
     return {
         "ticker": ticker,
         "sector": sector,
         "industry": industry,
         "market_cap": market_cap,
         "float_shares": float_shares,
+        "as_of": pd.Timestamp(as_of),
+    }
+
+
+def _si_row(ticker, short_interest_pct_float=None, days_to_cover=None,
+            short_interest_shares=None, settlement_date="2020-01-01", as_of="2020-01-01"):
+    """A row shaped like `SHORT_INTEREST_COLUMNS` -- short interest is its
+    own frame, never part of `ticker_meta` (see top10/data/base.py)."""
+    return {
+        "ticker": ticker,
+        "settlement_date": pd.Timestamp(settlement_date),
+        "short_interest_shares": short_interest_shares,
         "short_interest_pct_float": short_interest_pct_float,
         "days_to_cover": days_to_cover,
         "as_of": pd.Timestamp(as_of),
     }
+
+
+def _empty_short_interest():
+    return pd.DataFrame(columns=list(SHORT_INTEREST_COLUMNS))
 
 
 def _empty_earnings():
@@ -103,7 +120,8 @@ def _basic_inputs(n_days=25, tickers=("AAA", "BBB", "CCC")):
     return daily_bars, ticker_meta
 
 
-def _build(daily_bars, ticker_meta, earnings=None, labels_history=None, market_context=None, trade_date=TRADE_DATE):
+def _build(daily_bars, ticker_meta, earnings=None, labels_history=None, market_context=None,
+           trade_date=TRADE_DATE, short_interest=None):
     return t1_mod.build_t1_features(
         daily_bars,
         ticker_meta,
@@ -111,6 +129,7 @@ def _build(daily_bars, ticker_meta, earnings=None, labels_history=None, market_c
         labels_history if labels_history is not None else _empty_labels_history(),
         market_context if market_context is not None else _empty_market_context(),
         trade_date,
+        short_interest=short_interest,
     )
 
 
@@ -446,32 +465,20 @@ def test_short_interest_not_visible_before_publish_date():
     daily_bars, ticker_meta = _basic_inputs()
     publish_date = TRADE_DATE - pd.Timedelta(days=2)
 
-    meta_with_si = pd.concat(
-        [
-            ticker_meta,
-            pd.DataFrame(
-                [
-                    _meta_row(
-                        "AAA",
-                        sector="Technology",
-                        industry="Software",
-                        short_interest_pct_float=25.0,
-                        days_to_cover=3.5,
-                        as_of=publish_date,
-                    )
-                ]
-            ),
-        ],
-        ignore_index=True,
+    short_interest = pd.DataFrame(
+        [_si_row("AAA", short_interest_pct_float=25.0, days_to_cover=3.5, as_of=publish_date)]
     )
 
     # trade_date is BEFORE the publish date -> short interest must be NaN.
-    out_before = _build(daily_bars, meta_with_si, trade_date=publish_date - pd.Timedelta(days=1))
+    out_before = _build(
+        daily_bars, ticker_meta, trade_date=publish_date - pd.Timedelta(days=1),
+        short_interest=short_interest,
+    )
     row_before = out_before[out_before["ticker"] == "AAA"].iloc[0]
     assert pd.isna(row_before["short_interest_pct_float"])
 
     # trade_date is AFTER the publish date -> value must be forward-filled.
-    out_after = _build(daily_bars, meta_with_si, trade_date=TRADE_DATE)
+    out_after = _build(daily_bars, ticker_meta, trade_date=TRADE_DATE, short_interest=short_interest)
     row_after = out_after[out_after["ticker"] == "AAA"].iloc[0]
     assert row_after["short_interest_pct_float"] == 25.0
     assert row_after["days_to_cover"] == 3.5
@@ -490,22 +497,14 @@ def test_more_recent_knowable_short_interest_vintage_wins():
     old_publish = TRADE_DATE - pd.Timedelta(days=40)
     new_publish = TRADE_DATE - pd.Timedelta(days=5)
 
-    meta_with_si = pd.concat(
+    short_interest = pd.DataFrame(
         [
-            ticker_meta,
-            pd.DataFrame(
-                [
-                    _meta_row("AAA", sector="Technology", industry="Software",
-                              short_interest_pct_float=10.0, days_to_cover=1.0, as_of=old_publish),
-                    _meta_row("AAA", sector="Technology", industry="Software",
-                              short_interest_pct_float=40.0, days_to_cover=6.0, as_of=new_publish),
-                ]
-            ),
-        ],
-        ignore_index=True,
+            _si_row("AAA", short_interest_pct_float=10.0, days_to_cover=1.0, as_of=old_publish),
+            _si_row("AAA", short_interest_pct_float=40.0, days_to_cover=6.0, as_of=new_publish),
+        ]
     )
 
-    out = _build(daily_bars, meta_with_si, trade_date=TRADE_DATE)
+    out = _build(daily_bars, ticker_meta, trade_date=TRADE_DATE, short_interest=short_interest)
     row = out[out["ticker"] == "AAA"].iloc[0]
     assert row["short_interest_pct_float"] == 40.0
     assert row["days_to_cover"] == 6.0
@@ -664,6 +663,65 @@ def test_missing_ticker_meta_column_raises_loudly():
     broken_meta = ticker_meta.drop(columns=["market_cap"])
     with pytest.raises(KeyError):
         _build(daily_bars, broken_meta)
+
+
+# --- Defect 3: short_interest is its own frame, never merged into
+# ticker_meta -- a missing required column must raise, even (especially)
+# when the frame is empty. -------------------------------------------------
+
+
+def test_missing_short_interest_column_raises_even_when_empty():
+    """The negative case that matters most: an EMPTY short_interest frame
+    missing `days_to_cover` must still raise -- if an empty frame passes
+    silently, the fix did not land (this is exactly Defect 3's second bug:
+    the old `if not ticker_meta.empty` gate let an empty frame NaN
+    everything silently)."""
+    daily_bars, ticker_meta = _basic_inputs()
+    broken_short_interest = pd.DataFrame(
+        columns=[c for c in SHORT_INTEREST_COLUMNS if c != "days_to_cover"]
+    )
+    assert broken_short_interest.empty
+    with pytest.raises(KeyError):
+        _build(daily_bars, ticker_meta, short_interest=broken_short_interest)
+
+
+def test_missing_short_interest_column_raises_when_nonempty_too():
+    daily_bars, ticker_meta = _basic_inputs()
+    broken_short_interest = pd.DataFrame(
+        [{"ticker": "AAA", "settlement_date": TRADE_DATE, "short_interest_shares": 1.0,
+          "short_interest_pct_float": 5.0, "as_of": TRADE_DATE}]  # missing days_to_cover
+    )
+    with pytest.raises(KeyError):
+        _build(daily_bars, ticker_meta, short_interest=broken_short_interest)
+
+
+def test_well_formed_short_interest_produces_pit_gated_values():
+    """Positive case: a well-formed short_interest frame produces non-null
+    values via the `_latest_pit_row` lookup, and a row whose `as_of` is
+    AFTER decision_time is not used."""
+    daily_bars, ticker_meta = _basic_inputs()
+    decision_time = t1_mod.decision_time_t1(TRADE_DATE)
+
+    short_interest = pd.DataFrame(
+        [
+            # Knowable well before decision_time -- must be used.
+            _si_row("AAA", short_interest_pct_float=12.5, days_to_cover=2.0,
+                    as_of=TRADE_DATE - pd.Timedelta(days=10)),
+            # Published AFTER decision_time -- must NOT be used.
+            _si_row("BBB", short_interest_pct_float=99.0, days_to_cover=9.0,
+                    as_of=decision_time + pd.Timedelta(hours=1)),
+        ]
+    )
+
+    out = _build(daily_bars, ticker_meta, short_interest=short_interest)
+
+    aaa = out[out["ticker"] == "AAA"].iloc[0]
+    assert aaa["short_interest_pct_float"] == 12.5
+    assert aaa["days_to_cover"] == 2.0
+
+    bbb = out[out["ticker"] == "BBB"].iloc[0]
+    assert pd.isna(bbb["short_interest_pct_float"])
+    assert pd.isna(bbb["days_to_cover"])
 
 
 def test_ticker_with_no_meta_row_at_all_still_degrades_to_nan():
