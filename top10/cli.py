@@ -99,11 +99,29 @@ def _cmd_baselines(args: argparse.Namespace) -> int:
 
 
 def _cmd_walkforward(args: argparse.Namespace) -> int:
-    print(
-        "walkforward: this command requires a model_factory and pre-built features/"
-        "labels; invoke top10.pipeline.run_walkforward_step directly from a script. "
-        "No default on-disk wiring exists yet."
-    )
+    if args.variant is None:
+        print(
+            "walkforward: this command requires a model_factory and pre-built features/"
+            "labels; invoke top10.pipeline.run_walkforward_step directly from a script, "
+            "or pass --variant {t1b,t1b_tfm} to run top10.runner.run_variant."
+        )
+        return 0
+
+    from top10.runner import run_variant
+
+    result = run_variant(args.variant)
+
+    print(f"walkforward[{args.variant}]: feature_spec_hash={result['feature_spec_hash']}")
+    print(f"  n_rows={result['n_rows']} n_days={result['n_days']}")
+    print(result["per_year"].to_string(index=False))
+    print(f"  mean hits/day (test years): {result['mean_hits_per_day']:.4f}")
+    for name, comparison in result["vs_baseline"].items():
+        print(f"  vs {name}: mean_hits_delta={comparison['mean_hits_delta']:.4f} "
+              f"years_won={comparison['years_won']}/{comparison['years_total']}")
+        for year, record in sorted(comparison["per_year_record"].items()):
+            delta = record["model_mean_hits"] - record["baseline_mean_hits"]
+            print(f"    {year}: model={record['model_mean_hits']:.4f} "
+                  f"{name}={record['baseline_mean_hits']:.4f} delta={delta:+.4f}")
     return 0
 
 
@@ -267,6 +285,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_baselines.set_defaults(func=_cmd_baselines)
 
     p_walkforward = sub.add_parser("walkforward", help="Run walk-forward evaluation.")
+    p_walkforward.add_argument(
+        "--variant",
+        required=False,
+        default=None,
+        choices=("t1b", "t1b_tfm"),
+        help="Run top10.runner.run_variant for this feature variant.",
+    )
     p_walkforward.set_defaults(func=_cmd_walkforward)
 
     p_predict = sub.add_parser("predict", help="Predict and pre-commit for a trade date (09:25 ET).")

@@ -1,190 +1,249 @@
-# Structural features: short interest and days-to-cover
+# EXP-005-TFM — a fair, cheap test of TimesFM on the top-10 task
 
 ## Context
 
-EXP-003 fitted the first real model on 4.6 years of Nasdaq data. It beat the
-best baseline (B2, 5-day realized volatility) in 3 of 3 years — but by only
-0.06 hits/day, and **the margin shrank as training data grew** (+0.100 →
-+0.076 → +0.045). That trajectory is what noise looks like, not signal.
+The ask: use Google's TimesFM to predict the daily top-10 % gainers.
 
-The reason is visible in the feature list: every T1 feature is derived from
-price and volume. The model has no information about *why* a stock is
-primed to move — no float, no short interest, no crowding, no catalyst. It
-is being asked to predict explosive moves from the shape of past returns
-alone.
+TimesFM is a genuinely strong forecaster. But there is already decisive
+local evidence about it on this exact class of data, and it should frame
+everything below.
 
-The obvious fix is the "loaded spring" family of structural preconditions:
-small float, high short interest, high days-to-cover, thin liquidity. This
-plan adds the subset of those that can be built **correctly and for free**,
-and documents precisely why the rest cannot.
+**`/Users/taboost/quant/data/research/hyp120/VERDICT.md`** — sealed and
+adjudicated 2026-09-16, TimesFM 3.0 MLX, 50,182 daily windows over 19
+series, 2016–2026:
 
-It deliberately defers premarket/T2 work. That is the larger prize — B4 and
-the pre-registered claim both depend on it — but structural features are
-cheaper, and if they do not move T1 at all, that is important evidence
-about the ceiling before any money is spent.
+- **Direction: FAIL.** Sign hit rate 51.45% (equity drift). Per-series
+  Spearman(forecast, realized) = **−0.0088, CI [−0.0156, −0.0026]** —
+  negative, CI excludes zero.
+- **Magnitude: FAIL.** Quantile-derived sigma ties EWMA(0.94) exactly
+  (0.6808 vs 0.6807) and over-forecasts vol by ~18%.
 
-## What is actually buildable — verified against the live APIs
+Combined with EXP-004, where `xs_vol_rank` carried **7× the gain of the
+next feature**, the picture is: TimesFM's one usable output is a
+volatility estimator that ties a two-line EWMA, offered to a model
+already dominated by a volatility ranker.
 
-| Feature | Status | Evidence |
+**Honest prior: ~10–15%** that this produces a per-year-consistent
+improvement over EXP-003.
+
+It is still worth running, for three reasons that do not depend on it
+working: it closes the "a foundation model will find it" question with
+local evidence; it produces a reusable forecast cache; and it forces
+payment of a reproducibility debt that currently makes EXP-003 and
+EXP-004 uncitable.
+
+### The one hypothesis with a real chance
+
+Ranking by point forecast is the *worst* use — HYP-120 shows its rank
+correlation with outcomes is negative, and existing momentum features
+already own that channel. `q90 − q10` is not new either; it is EWMA vol
+with a 1.3 GB wrapper.
+
+The only quantity TimesFM emits that the incumbent cannot reconstruct is
+**conditional asymmetry** — whether the right tail is fatter than the
+left, given recent history. Nothing in the 15 T1 features measures
+predictive skew. That is the hypothesis. Everything else is a control.
+
+## Prerequisite: the reproducibility debt
+
+EXP-003 and EXP-004 ran from scratch scripts no longer on disk.
+`xs_vol_rank`, `xs_ret_rank`, `top90`, `logpx`, `dist52`, `vol20`,
+`vol5`, `relvol_prev` appear nowhere in the repo except EXP-004's prose.
+`validate_frame` / `write_features` were bypassed, `data/features/` is
+empty, `FEATURE_SPEC_VERSION` is still `"1"`.
+
+**Both logged variants rest on definitions that no longer exist**, so the
+TimesFM delta has nothing honest to measure against. This is step one,
+not a side quest.
+
+## Decisions taken
+
+**Checkpoint: TimesFM 2.5, Apache-2.0.** 3.0 weights are
+`timesfm-non-commercial-license-v1.0` — non-commercial, non-production.
+Any path to live trading needs 2.5. Consequence: 2.5 runs through
+`src/timesfm` (torch backend, 200M params), not the MLX 3.0 fast path,
+so expect materially lower throughput than 3.0's 666 series/s. Budget
+wall-clock accordingly; compute is still free and local.
+
+**Target: log returns, never raw close.** Two reasons. It removes the
+only plausible memorization key (see probes), and it stops split-day
+price jumps entering the context as fake ±50% returns.
+
+**Context: 256 sessions, min 128, `padding_mode="none"`.** History starts
+2018-05-22, so a 512 context would destroy 2019 and 2020 as evaluation
+years. Pre-declare 256 and never tune it — each context length tried is
+a variant.
+
+## Contamination probes
+
+TimesFM's pretraining corpus is undocumented — an exhaustive grep of the
+checkout, its bundled skill, and the cached `config.json` found no
+statement of what it trained on, no date range, no cutoff. This matters
+because every guard in this repo checks `as_of <= decision_time` on rows
+fed *in*; a pretrained model carries information in its weights, which
+those guards structurally cannot inspect.
+
+One structural fact makes this tractable: in
+`timesfm3/mlx/timesfm3_forecaster.py`, **`ts_ids` is never passed to the
+model** — it only labels the output. The model cannot see ticker
+identity except through the numbers. So memorization needs a *numeric*
+key, and the only identifying one is the absolute price level.
+
+**Probe A — level key (sharpest, ~2 min).** Forecast ~10k windows three
+ways: (A) log returns, (B) raw close, (C) raw close × a per-window
+random constant — identical shape, destroyed level. Compare B vs C by
+CRPS converted to return space and normalized by trailing 20d realized
+vol (without that normalization the comparison is mechanically
+meaningless). **If B beats C with CI excluding zero and >2% effect, the
+price level carries information the shape does not — that is
+memorization. STOP.** Expected: no difference, and the primary encoding
+is returns anyway, which closes this channel by construction.
+
+**Probe B — skill floor.** Rank by `tfm_q50` on a 2021 cache; hits/day
+vs B0 0.084 / B1 0.433 / B2 0.603, plus daily cross-sectional Spearman
+with date-block bootstrap. If there is no directional skill,
+contamination-on-direction is moot. **If cross-sectional IC > +0.05 with
+CI excluding zero, stop and investigate** — that number does not exist
+in nature on 1,256 Nasdaq names.
+
+**Probe C — exposure tiers.** Mega-caps (likely in any corpus) vs
+delisted microcaps (unlikely), coarsened-exact-matched on vol quintile ×
+price tercile × month. Only the *directional* leg is diagnostic — a
+calibration advantage for mega-caps is expected and is not evidence of
+contamination. Pre-declare that so the probe cannot be over-read later.
+
+**Residual, stated in the EXP file:** none of this inspects the weights.
+The probes bound the risk behaviourally; feeding returns rather than
+prices is the actual structural mitigation.
+
+## Gate R — the cheap kill, and the point of the design
+
+On the 2021 cache, in rank space with per-day cross-sectional demeaning:
+Spearman of each TFM feature against each incumbent feature, and
+residual R² after projecting out `{vol5, vol20, xs_vol_rank,
+relvol_prev, dist52, logpx}`.
+
+> **If every TFM feature has |Spearman| ≥ 0.90 with `xs_vol_rank` or
+> residual variance < 10% after projection → STOP. Write EXP-005 as a
+> null. No full cache, no model fit.**
+
+~30 minutes, zero model fits, and *more* informative than a fit would
+be, because it says **why**: the model is re-parameterizing volatility
+rather than adding information. This is the modal outcome.
+
+## Pre-declared features (locked by spec hash before any fit)
+
+| Feature | Definition | Role |
 |---|---|---|
-| Short interest | **BUILD** | Polygon `/stocks/v1/short-interest` works on the free key, bi-monthly, back to 2017-12-29 |
-| Days-to-cover | **BUILD** | Returned precomputed by the same endpoint, using Polygon's *consolidated* `avg_daily_volume` |
-| Short interest % float | **PARTIAL** | Needs float; see below. Use short-interest-to-ADV instead |
-| Float / market cap | **REJECT** | Not point-in-time — `date=2020-06-01` returns `None`; only current values exist |
-| Premarket RVOL | **DEFER** | Requires premarket bars; deferred by decision |
-| Options activity / gamma | **REJECT** | No vendor in `docs/DATA_SOURCES.md`, no scaffolding, zero repo references |
-| Social mention velocity | **REJECT (forward-only)** | Pushshift is dead; no historical source. Collectable going forward only |
-| Scheduled catalysts | **REJECT for backtest** | Finnhub free tier is ~1 month lookback; unusable over 2018–2022 |
+| `tfm_q50` | median h=1 forecast, return space | direction — expected null |
+| `tfm_q90` | 90th pct h=1 | right-tail level |
+| `tfm_spread` | q90 − q10 | **redundancy control** — expect ≈ vol |
+| `tfm_skew_norm` | ((q90−q50) − (q50−q10)) / (q90−q10) | **the hypothesis** |
+| `tfm_upside_ratio` | (q90−q50) / (q50−q10) | hypothesis, alt scaling |
+| `tfm_q90_xs_rank` | cross-sectional pct of `tfm_q90` that day | task is cross-sectional |
+| `tfm_skew_xs_rank` | cross-sectional pct of `tfm_skew_norm` | same |
 
-### Why float is rejected rather than merely unavailable
-
-Polygon returns `weighted_shares_outstanding` only as a **current** value.
-Applying today's share count to a 2020 row imports every subsequent
-dilution, buyback and offering. For the microcaps that dominate top-gainer
-lists, dilution is enormous *and directly correlated with the squeeze-and-
-collapse events being predicted*. It would inflate a backtest convincingly
-and fail live — the exact P3 failure mode.
-
-LABEL_SPEC (frozen, hashed) binds this explicitly: "Every upstream row used
-to create labels **or later features** must satisfy `as_of <= decision_time`."
-
-Substitute **short-interest-to-ADV** (short shares ÷ consolidated average
-daily volume) which is fully point-in-time and captures the same crowding
-intuition without the float denominator.
-
-## Blocking defects — fix before any new features
-
-These are not cleanup. Each one silently corrupts the result of the work
-that follows.
-
-### 1. The T1 path cannot run on real adapter output
-`top10/features/t1.py:339-361` raises `KeyError` for missing
-`short_interest_pct_float` / `days_to_cover`, which it reads from
-`ticker_meta`. But `TICKER_META_COLUMNS` (`top10/data/base.py:45-66`)
-deliberately excludes them — they live in `SHORT_INTEREST_COLUMNS`, fetched
-by a separate `short_interest()` method, and **nothing joins the two**.
-`pipeline.ingest()` fetches only daily_bars / corporate_actions /
-ticker_meta / earnings.
-
-Worse, the guard is gated `if not ticker_meta.empty:` — an empty frame
-skips it and silently NaNs every metadata feature.
-
-This is exactly the feature being added, so it must be fixed first.
-
-### 2. The family-wise correction denominator is silently zero
-`top10/experiment.py::count_corrected_variants()` returns **0**. Its regex
-expects the literal template line `**Counts toward family-wise correction?
-(y/n)**: y`; EXP-003 was hand-written as `**Counts toward family-wise
-correction?** **YES**`. The true count is 1.
-
-Adding feature families is precisely what multiplies tested variants, so
-the Holm denominator must be correct *before* more variants exist. A
-denominator of 0 or 1 when the truth is 5 turns a null result into a
-"discovery".
-
-### 3. The cost guard is not tracking real spend
-`top10/data/cost_guard.py` reads `data/raw/databento/_spend_ledger.json`,
-which **does not exist**. The $35.47 actually spent was written to an
-ad-hoc `preholdout/_spend.json` by a script that bypassed `CostGuard`. The
-guard believes $0 is spent against a $100 ceiling, so it would authorize
-$135.47 cumulative — past the $125 credit into real billing.
-
-Not needed for this plan (no spend), but it must be fixed before the
-deferred premarket pull.
+Seven features is not multiple testing **provided there is exactly one
+model fit**. Choosing three after seeing precision@10 is. The spec hash
+is what makes that enforceable.
 
 ## Implementation
 
-### Step 1 — Fix the three defects
-- `top10/experiment.py`: widen `_COUNTS_LINE_RE` to accept both the
-  template form and the prose form, **and** rewrite EXP-003's line to the
-  canonical template form. Add a test asserting `count_corrected_variants()
-  == 1` against the real `experiments/` directory.
-- `top10/data/cost_guard.py`: reconcile the ledger — seed it from
-  `preholdout/_spend.json` so `spent` reads $35.47. Add a test that the
-  guard refuses a request that would exceed the *credit*, not just the
-  ceiling.
-- `top10/features/t1.py`: accept short-interest data as its **own frame
-  parameter** rather than expecting it merged into `ticker_meta`. Remove
-  the `if not ticker_meta.empty` gate so an empty frame raises instead of
-  silently NaN-ing.
+**`top10/features/bars_t1.py`** *(new)* — rebuild the 15 EXP-003
+features from `universe_liquidity.parquet` alone, pure pandas, names
+matching the EXP-004 importance table exactly so both experiments become
+citable. Stamp `as_of` = 16:00 ET on `prev_date`.
 
-### Step 2 — Add a short-interest ingest path
-`top10/pipeline.py`: add `short_interest` to the `_PIT_DATASETS` tuple and
-to `ingest()`'s fetcher dict, so it is persisted to `data/pit/` like every
-other source. Reuse the existing `PolygonSource.short_interest()`
-(`top10/data/polygon.py:412-489`) — it is implemented, paginates correctly,
-and already stamps `as_of` as the publish date (or `settlement_date + 14d`
-as a deliberately conservative fallback). Do not reimplement it.
+**`top10/features/tfm.py`** *(new)* — the 7 features above from a
+quantile frame. Never imports `timesfm`. Unit-testable with synthetic
+quantiles.
 
-### Step 3 — Feature engineering
-New columns appended to `T1_COLUMNS` in `top10/features/spec.py`, bumping
-`FEATURE_SPEC_VERSION` from `"1"` to `"2"`:
+**`top10/forecast/timesfm_cache.py`** *(new)* — the ONLY module touching
+TimesFM, lazily imported inside the function (mirror the `lightgbm`
+pattern in `top10/model.py`). Reuse the quantile/sigma conventions in
+`/Users/taboost/quant/research/tfm/forecast.py` rather than reinventing.
+Writes `data/raw/timesfm/<model_tag>/<year>.parquet`, resumable per
+year. **Internal assertion:** the context's last element must correspond
+to `prev_date`, and `ctx_len == min(256, sessions strictly before
+trade_date)`.
 
-- `short_interest_shares` — raw, log-scaled
-- `short_interest_to_adv` — short shares ÷ consolidated ADV (the float-free
-  crowding measure)
-- `days_to_cover` — Polygon's precomputed figure
-- `short_interest_chg_1p` — change vs the prior bi-monthly reading (the
-  *rate of change* is often more informative than the level)
-- `short_interest_staleness_days` — days since the reading became knowable;
-  bi-monthly data is up to ~3 weeks stale and the model should be able to
-  discount accordingly
+**`top10/features/spec.py`** *(edit)* — add `T1B_SPEC` and
+`T1B_TFM_SPEC`; add both to the `write_features` decision-time ladder;
+bump `FEATURE_SPEC_VERSION` to `"2"`. **Also fix a latent defect found
+during design:** the task dispatch falls through to `decision_time =
+None` for an unknown task, and `assert_decision_time_safe` is then
+skipped — so registering any new task name silently disables the leakage
+gate on write. The `else` must raise. This bites immediately, because
+this plan adds two task names.
 
-Reuse `_latest_pit_row` (`top10/features/t1.py:117-132`) for the
-as-of-gated lookup — it is the established forward-fill-from-publish-date
-pattern and must not be re-invented. Values forward-fill from `as_of` only,
-never from `settlement_date`.
+**`top10/runner.py`** *(new)* — the committed walk-forward runner
+EXP-003/004 lacked. Loads parquet → builds features through
+`write_features` so the leakage gate fires on every write →
+`expanding_window_splits(retrain="yearly")` → `run_walkforward` →
+`compare_to_baseline` → `log_experiment`. **No `unseal_token` parameter
+anywhere in this module** — the holdout stays sealed structurally.
 
-### Step 4 — Re-run the walk-forward
-Same protocol as EXP-003 so the comparison is clean: expanding window,
-yearly retrain, test years 2020/2021/2022, LightGBM binary with
-auto-computed `scale_pos_weight`. Report precision@10 and hits/day against
-B0/B1/B2, and against **the EXP-003 model itself** — that delta is the
-actual question this plan asks.
+**`top10/cli.py`** *(edit)* — extend the existing `walkforward`
+subparser with `--variant {t1b, t1b_tfm}`.
 
-Log as **EXP-004, counting toward family-wise correction** (variant 2).
+**Environment — two processes, deliberately.** The top-10 venv is Python
+3.14; TimesFM must not be installed into it. The cache builder runs
+under `/Users/taboost/quant/.venv313` and writes parquet; everything in
+`top10/` reads that parquet and never imports TimesFM. This keeps a
+non-commercially-licensed dependency out of the project graph, makes the
+expensive step resumable, and means a null costs nothing to re-verify.
+Add `data/raw/timesfm/` to `.gitignore`.
 
-## What this plan explicitly does not claim
+## Family-wise correction
 
-It does not evaluate the pre-registered success criterion. That requires
-B4, which requires premarket bars, which are deferred. A result here is
-"structural features improve (or fail to improve) T1 over EXP-003" — a
-useful internal comparison and nothing more.
-
-If short interest moves T1 materially, premarket becomes worth its cost. If
-it does not, that is strong evidence the T1 ceiling is low, and the
-sensible next move is Alpaca's free IEX premarket feed rather than paid
-data.
+`count_corrected_variants()` currently returns 2. **The TimesFM arm
+counts as exactly one variant.** Probes and Gate R produce no
+precision@10 claim and do not count — state that in the EXP file.
+Volume-as-covariate and an `|r|` target are pre-declared as the *only*
+conditional follow-ups, runnable solely if the primary is non-null; if
+it is null they are not run and the count stays at 1. Expected
+denominator: 3.
 
 ## Verification
 
 ```bash
-# 1. Defects fixed
-./.venv/bin/python -m pytest tests/ -q                    # expect all pass
-./.venv/bin/python -c "from top10.experiment import count_corrected_variants; \
-  print(count_corrected_variants())"                      # expect 1, not 0
-./.venv/bin/python -c "from top10.data.cost_guard import CostGuard; \
-  g=CostGuard(); print(g.spent)"                          # expect 35.47, not 0.0
+cd /Users/taboost/top-10-movers && .venv/bin/python -m pytest -q
 
-# 2. Short interest ingested and point-in-time
-#    every as_of must be >= settlement_date (publish lag), never equal
-./.venv/bin/python -c "import pandas as pd; \
-  d=pd.read_parquet('data/pit/.../short_interest...'); \
-  print((d.as_of >= d.settlement_date).all())"            # expect True
+# STEP 1 GATE — the repro must land first
+.venv/bin/python -m top10.cli walkforward --variant t1b
+#   EXPECT mean 0.660 ± 0.02 hits/day; per-year vs B2 +0.100 / +0.076 / +0.045
+#   If it does not reproduce, STOP — there is no incumbent to measure against
 
-# 3. Features build without KeyError on real adapter output
-python -m top10.cli features --task T1 --start 2018-05-01 --end 2022-12-31
+.venv/bin/python -c "from top10.features.spec import T1B_SPEC, FEATURE_SPEC_VERSION; \
+  print(FEATURE_SPEC_VERSION, T1B_SPEC.spec_hash)"
+#   EXPECT "2" + a hash pasted into the EXP file BEFORE any fit
 
-# 4. Anti-leakage guards still hold on the new columns
-#    assert_self_exclusion must not flag them; shuffle_label_test must fail
-./.venv/bin/python -m pytest tests/test_leakage.py -q
+# Cache (different interpreter, on purpose)
+/Users/taboost/quant/.venv313/bin/python -m top10.forecast.timesfm_cache --year 2021 --ctx 256
+#   EXPECT q10<=...<=q90 monotone every row; ctx_len==min(256, prior sessions)
+#   Determinism: re-forecast 100 fixed windows, EXPECT max|delta| < 1e-6
 
-# 5. The comparison that matters
-./.venv/bin/python <walk-forward script>
-#    expect: hits/day vs EXP-003's 0.660, and vs B2's 0.603
+# Probes — EXPECT (per HYP-120): hits/day <= B1, IC CI straddling 0,
+#   no level-key effect, no Tier-H direction gap
+
+# GATE R — the cheap kill
+#   EXPECT (modal): every TFM feature |Spearman| >= 0.90 vs xs_vol_rank
+#                   or residual variance < 10%  ->  NULL, stop here
+
+# Only if Gate R passes
+.venv/bin/python -m top10.cli walkforward --variant t1b_tfm
+#   Read the PER-YEAR TREND, not the mean. EXP-004's precedent binds:
+#   +0.100 -> +0.004 -> -0.025 was correctly called null despite a +0.026 mean.
 ```
 
-**Pass/fail signal:** the run either beats EXP-003's 0.660 hits/day by a
-margin that holds or grows across 2020 → 2021 → 2022, or it does not.
-A margin that shrinks year-over-year — as EXP-003's did — is noise, and
-should be reported as such rather than as an improvement.
+**Pass/fail signal:** a margin over EXP-003 that *holds or grows* across
+2020 → 2021 → 2022. A shrinking margin is noise and gets reported as
+null, exactly as EXP-004 was.
+
+## What this cannot do
+
+It cannot evaluate the pre-registered claim — that needs B4, which needs
+premarket bars, still unpulled. It cannot see news, and the plan's own
+P8 estimates 40–60% of top movers are driven by unscheduled news that is
+absent from price history by definition. A positive result here would be
+an internal improvement over EXP-003, nothing more.

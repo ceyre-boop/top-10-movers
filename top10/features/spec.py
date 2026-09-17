@@ -20,10 +20,11 @@ from typing import Sequence
 import pandas as pd
 
 from top10.config import DATA_FEATURES
+from top10.features.bars_t1 import BARS_T1_FEATURES
 from top10.hashing import hash_spec
 from top10.storage import spec_dir, write_parquet
 
-FEATURE_SPEC_VERSION = "1"
+FEATURE_SPEC_VERSION = "2"
 
 # --- T1 (decision time: prior close, 16:00 ET on t-1) -----------------------
 
@@ -109,6 +110,42 @@ T2_COLUMNS: tuple[str, ...] = T1_COLUMNS[:-1] + _T2_EXTRA_COLUMNS + ("as_of",)
 PRIOR_CLOSE_COLUMNS: tuple[str, ...] = ("trade_date", "ticker", "close", "as_of")
 
 
+# --- T1B (bars-only T1 -- the EXP-003/EXP-004 reproducibility repro) --------
+#
+# Decision time: T1 (16:00 ET on the trade date's own prior TRADING day),
+# same as `T1_SPEC`, but built ENTIRELY from
+# `data/raw/databento/preholdout/universe_liquidity.parquet` -- no
+# ticker_meta/earnings/short_interest dependency. See
+# `top10.features.bars_t1.build_bars_t1` for the feature definitions; the
+# 15 names here MUST match EXP-004's importance table exactly so both
+# experiments become citable again.
+
+T1B_COLUMNS: tuple[str, ...] = (
+    "trade_date",
+    "ticker",
+    *BARS_T1_FEATURES,
+    "as_of",
+)
+
+# --- T1B_TFM (T1B + TimesFM quantile-derived features) ----------------------
+#
+# Same T1 decision time as T1B -- the TimesFM quantile cache is itself
+# built from data knowable strictly before that decision time (see
+# `top10.forecast.timesfm_cache`), so no re-stamping is needed.
+
+_T1B_TFM_EXTRA_COLUMNS: tuple[str, ...] = (
+    "tfm_q50",
+    "tfm_q90",
+    "tfm_spread",
+    "tfm_skew_norm",
+    "tfm_upside_ratio",
+    "tfm_q90_xs_rank",
+    "tfm_skew_xs_rank",
+)
+
+T1B_TFM_COLUMNS: tuple[str, ...] = T1B_COLUMNS[:-1] + _T1B_TFM_EXTRA_COLUMNS + ("as_of",)
+
+
 @dataclass(frozen=True)
 class FeatureSpec:
     """Locks a feature task's column contract for hashing + validation."""
@@ -126,6 +163,8 @@ class FeatureSpec:
 
 T1_SPEC = FeatureSpec(task="T1", columns=T1_COLUMNS, version=FEATURE_SPEC_VERSION)
 T2_SPEC = FeatureSpec(task="T2", columns=T2_COLUMNS, version=FEATURE_SPEC_VERSION)
+T1B_SPEC = FeatureSpec(task="T1B", columns=T1B_COLUMNS, version=FEATURE_SPEC_VERSION)
+T1B_TFM_SPEC = FeatureSpec(task="T1B_TFM", columns=T1B_TFM_COLUMNS, version=FEATURE_SPEC_VERSION)
 
 
 def validate_frame(df: pd.DataFrame, spec: FeatureSpec) -> None:
@@ -184,7 +223,10 @@ def write_features(
     from top10.leakage import assert_decision_time_safe
 
     trade_date_ts = pd.Timestamp(trade_date)
-    if spec.task == "T1":
+    if spec.task in ("T1", "T1B", "T1B_TFM"):
+        # T1B/T1B_TFM share T1's decision time (16:00 ET on the trade
+        # date's prior trading day) -- see top10.features.bars_t1's
+        # module docstring.
         from top10.features.t1 import decision_time_t1
 
         decision_time = decision_time_t1(trade_date_ts)
@@ -193,10 +235,21 @@ def write_features(
 
         decision_time = decision_time_t2(trade_date_ts)
     else:
-        decision_time = None
+        # Defect (CONFIRMED during T1B/T1B_TFM registration): this branch
+        # previously fell through to `decision_time = None`, and the guard
+        # below only runs `assert_decision_time_safe` when `decision_time
+        # is not None` -- so registering ANY new task name here silently
+        # disabled the leakage gate on write for that task, with no error
+        # of any kind. An unregistered task must raise, not write
+        # unguarded.
+        raise ValueError(
+            f"write_features: unknown spec.task {spec.task!r} -- no decision-time "
+            "rule is registered for it, so the leakage gate cannot be applied. "
+            "Register a decision-time branch for this task before writing "
+            "features for it; refusing to write unguarded."
+        )
 
-    if decision_time is not None:
-        assert_decision_time_safe(df, decision_time)
+    assert_decision_time_safe(df, decision_time)
 
     path = feature_output_path(spec, trade_date)
     write_parquet(df, path)
